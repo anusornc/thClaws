@@ -379,6 +379,38 @@ pub async fn authorize(
         .get("expires_in")
         .and_then(|v| v.as_u64())
         .unwrap_or(3600);
+
+    // Validate granted scope. RFC 6749 §5.1 says the `scope` field is
+    // OPTIONAL in the response — if present, it's the set actually
+    // granted. If it differs from what we asked for, warn loudly so
+    // the user notices a server that silently narrowed / widened the
+    // grant; we accept the narrower set either way (we have no way to
+    // require the wider).
+    if let Some(granted) = tv.get("scope").and_then(|v| v.as_str()) {
+        let requested: std::collections::HashSet<&str> = scope.split_whitespace().collect();
+        let got: std::collections::HashSet<&str> = granted.split_whitespace().collect();
+        let missing: Vec<&str> = requested.difference(&got).copied().collect();
+        let extra: Vec<&str> = got.difference(&requested).copied().collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            eprintln!(
+                "\x1b[33m[oauth] scope mismatch — requested: [{}], granted: [{}]\x1b[0m",
+                scope, granted
+            );
+            if !missing.is_empty() {
+                eprintln!(
+                    "\x1b[33m  missing from grant: {}\x1b[0m",
+                    missing.join(", ")
+                );
+            }
+            if !extra.is_empty() {
+                eprintln!(
+                    "\x1b[33m  server added: {} (unexpected — verify AS is legit)\x1b[0m",
+                    extra.join(", ")
+                );
+            }
+        }
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -456,7 +488,14 @@ pub async fn refresh(client: &Client, entry: &TokenEntry) -> Result<TokenEntry> 
     })
 }
 
-/// Check whether a token entry is still valid (with a 60 s margin).
+/// Clock-skew safety margin. We proactively treat a token as expired
+/// this many seconds before its real expiry so a clock drift between
+/// us and the authorization server doesn't leave us waving a token
+/// the server has just rejected. 5 minutes covers typical NTP drift
+/// on consumer machines and matches common JWT `nbf`/`exp` tolerances.
+const TOKEN_SKEW_MARGIN_SECS: u64 = 300;
+
+/// Check whether a token entry is still valid.
 pub fn is_valid(entry: &TokenEntry) -> bool {
     if entry.access_token.is_empty() {
         return false;
@@ -465,19 +504,27 @@ pub fn is_valid(entry: &TokenEntry) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    entry.expires_at == 0 || now + 60 < entry.expires_at
+    entry.expires_at == 0 || now + TOKEN_SKEW_MARGIN_SECS < entry.expires_at
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// Bind the OAuth callback server. Prefer an OS-assigned ephemeral port
+/// (port 0) so another local process can't predict our callback port and
+/// race us to claim it between runs. Fall back to the historical fixed
+/// range only if the ephemeral bind fails (e.g. tight sandbox / firewall
+/// policy on the loopback interface).
 async fn find_listener() -> Result<tokio::net::TcpListener> {
+    if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", 0u16)).await {
+        return Ok(l);
+    }
     for port in CALLBACK_PORT_START..=CALLBACK_PORT_END {
         if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
             return Ok(l);
         }
     }
     Err(Error::Provider(format!(
-        "oauth: could not bind callback server on ports {CALLBACK_PORT_START}-{CALLBACK_PORT_END}"
+        "oauth: could not bind callback server (ephemeral or ports {CALLBACK_PORT_START}-{CALLBACK_PORT_END})"
     )))
 }
 

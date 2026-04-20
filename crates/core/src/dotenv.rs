@@ -109,6 +109,71 @@ pub fn remove_from_user_env(var: &str) -> crate::error::Result<Option<PathBuf>> 
     Ok(Some(path))
 }
 
+/// Variables that must NEVER be settable from a `.env` file. A
+/// malicious project-local `.env` could otherwise steer the process to
+/// a poisoned binary (`PATH`), load an attacker's dynamic library
+/// (`LD_PRELOAD`, `DYLD_*`), redirect proxy traffic
+/// (`HTTP_PROXY`/`HTTPS_PROXY`), or move the home directory out from
+/// under us. Setting these through the user's shell profile is fine —
+/// the attack surface is specifically *project-local* `.env` files
+/// shipped by cloned repos.
+const DOTENV_BLOCKLIST: &[&str] = &[
+    // Binary resolution / library injection
+    "PATH",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    // Identity / filesystem root
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    // Network interception
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    // thclaws internals an attacker could hijack
+    "THCLAWS_MCP_ALLOW_ALL",
+    "THCLAWS_CONFIG_DIR",
+    "THCLAWS_DATA_DIR",
+    // Shell hook injection
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "PS1",
+    "PS2",
+    "PS4",
+    "ZDOTDIR",
+    "IFS",
+];
+
+fn is_blocked_key(key: &str) -> bool {
+    let up = key.to_ascii_uppercase();
+    // Exact blocklist match.
+    if DOTENV_BLOCKLIST.iter().any(|b| *b == up) {
+        return true;
+    }
+    // Any LC_* / LANG override is safe, but anything starting with
+    // DYLD_ or LD_ that we didn't enumerate should still be blocked —
+    // the loader honours runtime-specific variants we may not have
+    // listed.
+    if up.starts_with("LD_") || up.starts_with("DYLD_") {
+        return true;
+    }
+    false
+}
+
 fn load_file(path: &Path) {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
@@ -129,6 +194,15 @@ fn load_file(path: &Path) {
             || (value.starts_with('\'') && value.ends_with('\''))
         {
             value = &value[1..value.len() - 1];
+        }
+
+        if is_blocked_key(key) {
+            eprintln!(
+                "\x1b[33m[dotenv] ignoring {} from {} — security-sensitive var cannot be set via .env\x1b[0m",
+                key,
+                path.display()
+            );
+            continue;
         }
 
         // Only set if not already in the environment.
@@ -165,6 +239,43 @@ mod tests {
         // Cleanup.
         std::env::remove_var("TEST_DOTENV_A");
         std::env::remove_var("TEST_DOTENV_B");
+    }
+
+    #[test]
+    fn blocked_keys_are_not_loaded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "PATH=/attacker/bin\n\
+             LD_PRELOAD=/tmp/evil.so\n\
+             DYLD_INSERT_LIBRARIES=/tmp/x.dylib\n\
+             LD_SOMETHING_NEW=hi\n\
+             THCLAWS_MCP_ALLOW_ALL=1\n\
+             TEST_DOTENV_OK=safe\n",
+        )
+        .unwrap();
+
+        let orig_path = std::env::var("PATH").ok();
+        std::env::remove_var("LD_PRELOAD");
+        std::env::remove_var("DYLD_INSERT_LIBRARIES");
+        std::env::remove_var("LD_SOMETHING_NEW");
+        std::env::remove_var("THCLAWS_MCP_ALLOW_ALL");
+        std::env::remove_var("TEST_DOTENV_OK");
+
+        load_file(&path);
+
+        // Dangerous keys must be ignored (including LD_*/DYLD_* variants
+        // we haven't individually enumerated).
+        assert_eq!(std::env::var("PATH").ok(), orig_path);
+        assert!(std::env::var("LD_PRELOAD").is_err());
+        assert!(std::env::var("DYLD_INSERT_LIBRARIES").is_err());
+        assert!(std::env::var("LD_SOMETHING_NEW").is_err());
+        assert!(std::env::var("THCLAWS_MCP_ALLOW_ALL").is_err());
+        // Non-dangerous keys still load.
+        assert_eq!(std::env::var("TEST_DOTENV_OK").unwrap(), "safe");
+
+        std::env::remove_var("TEST_DOTENV_OK");
     }
 
     #[test]
