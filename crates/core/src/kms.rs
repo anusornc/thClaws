@@ -69,10 +69,18 @@ impl KmsRef {
         self.root.join("SCHEMA.md")
     }
 
-    /// Read `index.md`. Returns `""` (not an error) when the file is absent —
-    /// a fresh KMS with no entries yet is a valid state.
+    /// Read `index.md`. Returns `""` (not an error) when the file is absent,
+    /// OR when the path is a symlink (refused to prevent a cloned KMS
+    /// with `index.md -> /etc/passwd` from exfiltrating through the
+    /// system prompt). A fresh KMS with no entries yet is a valid state.
     pub fn read_index(&self) -> String {
-        std::fs::read_to_string(self.index_path()).unwrap_or_default()
+        let path = self.index_path();
+        if let Ok(md) = std::fs::symlink_metadata(&path) {
+            if md.file_type().is_symlink() {
+                return String::new();
+            }
+        }
+        std::fs::read_to_string(&path).unwrap_or_default()
     }
 
     /// Resolve a page name to a file path inside `pages/`. `.md` is added

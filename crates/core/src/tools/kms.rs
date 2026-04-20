@@ -85,6 +85,16 @@ impl Tool for KmsSearchTool {
         let re = Regex::new(pattern).map_err(|e| Error::Tool(format!("regex: {e}")))?;
 
         let pages_dir = kref.pages_dir();
+        // Refuse to walk if `pages/` itself is a symlink. Entry-level
+        // symlink filtering below can't save us from a `pages -> /etc`
+        // symlink because /etc's contents aren't themselves symlinks.
+        if let Ok(md) = std::fs::symlink_metadata(&pages_dir) {
+            if md.file_type().is_symlink() {
+                return Err(Error::Tool(format!(
+                    "kms '{kms_name}' has a symlinked pages/ directory — refusing to read"
+                )));
+            }
+        }
         let Ok(entries) = std::fs::read_dir(&pages_dir) else {
             return Ok(String::new());
         };

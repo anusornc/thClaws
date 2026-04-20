@@ -65,39 +65,56 @@ impl TokenStore {
             .unwrap_or_default()
     }
 
-    /// Serialise + write atomically with `0600` permissions on Unix so
-    /// other users / processes on the machine can't read cached refresh
-    /// tokens. On Windows we rely on the default per-user ACL.
+    /// Serialise + write with `0600` permissions on Unix so other users /
+    /// processes on the machine can't read cached refresh tokens. On
+    /// Windows we rely on the default per-user ACL.
+    ///
+    /// Ordering is critical:
+    ///   1. Ensure parent dir exists and is `0700` (so a sibling process
+    ///      can't have snuck a world-readable `oauth_tokens.json` in
+    ///      before we got here; also prevents directory-listing recon).
+    ///   2. Open the file. If it exists, `mode(0o600)` on `open` is
+    ///      ignored — so we must tighten perms *before* writing secrets.
+    ///   3. Chmod `0600` via `set_permissions`.
+    ///   4. Only then write the token bytes.
     pub fn save(&self) {
         let Some(path) = Self::path() else { return };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(parent) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o700);
+                    let _ = std::fs::set_permissions(parent, perms);
+                }
+            }
         }
         let contents = serde_json::to_string_pretty(self).unwrap_or_default();
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // Open the file with 0600 explicitly on creation. If the
-            // file already exists with a more-permissive mode, tighten
-            // it defensively.
-            if let Ok(mut f) = std::fs::OpenOptions::new()
+            use std::os::unix::fs::PermissionsExt;
+            // Open with 0600 on creation. If the file pre-existed under a
+            // looser mode (sibling process, stale umask), tighten BEFORE
+            // writing secrets. `mode()` on `open` is ignored when the
+            // file already exists, so `set_permissions` is the real gate.
+            let open_result = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&path)
-            {
+                .open(&path);
+            if let Ok(mut f) = open_result {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&path, perms);
+                }
                 use std::io::Write;
                 let _ = f.write_all(contents.as_bytes());
-            }
-            // Belt-and-suspenders: even if the file pre-existed with a
-            // looser mode, clamp it now.
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
             }
         }
 
@@ -150,20 +167,20 @@ pub struct OAuthMetadata {
     pub authorization_server_origin: String,
 }
 
-/// Extract a scheme+host+port origin from a URL string. Returns the
-/// trimmed input if parsing fails so callers always get a non-empty
-/// fingerprint.
-fn origin_of(url_str: &str) -> String {
-    match url::Url::parse(url_str) {
-        Ok(u) => {
-            let host = u.host_str().unwrap_or("");
-            match u.port() {
-                Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
-                None => format!("{}://{}", u.scheme(), host),
-            }
-        }
-        Err(_) => url_str.trim_end_matches('/').to_string(),
-    }
+/// Extract a scheme+host+port origin from a URL string. Fails hard on
+/// unparseable input — accepting a garbage fingerprint would let an
+/// attacker controlling the AS metadata match arbitrary strings on
+/// subsequent discoveries, silently defeating the AS-binding check.
+fn origin_of(url_str: &str) -> Result<String> {
+    let u = url::Url::parse(url_str)
+        .map_err(|e| Error::Provider(format!("oauth: cannot parse AS url '{url_str}': {e}")))?;
+    let host = u
+        .host_str()
+        .ok_or_else(|| Error::Provider(format!("oauth: AS url '{url_str}' has no host")))?;
+    Ok(match u.port() {
+        Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
+        None => format!("{}://{}", u.scheme(), host),
+    })
 }
 
 /// Discover the OAuth authorization server for an MCP HTTP endpoint.
@@ -243,7 +260,7 @@ pub async fn discover(client: &Client, mcp_url: &str) -> Result<OAuthMetadata> {
         })
         .unwrap_or_default();
 
-    let authorization_server_origin = origin_of(&auth_server);
+    let authorization_server_origin = origin_of(&auth_server)?;
 
     Ok(OAuthMetadata {
         authorization_endpoint,
@@ -649,6 +666,47 @@ mod tests {
             expires_at: 0,
             authorization_server: issuer.map(String::from),
         }
+    }
+
+    #[test]
+    fn origin_of_rejects_unparseable_urls() {
+        assert!(origin_of("not a url at all").is_err());
+        assert!(origin_of("").is_err());
+        // Missing host → still reject.
+        assert!(origin_of("file:///etc/passwd").is_err());
+        // Happy paths.
+        assert_eq!(
+            origin_of("https://as.example/foo").unwrap(),
+            "https://as.example"
+        );
+        assert_eq!(
+            origin_of("https://as.example:9443/foo").unwrap(),
+            "https://as.example:9443"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_parent_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = scoped_home();
+        // Pre-create parent dir with loose perms to simulate a
+        // sibling process that got there first.
+        let path = TokenStore::path().unwrap();
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let mut loose = std::fs::metadata(parent).unwrap().permissions();
+        loose.set_mode(0o755);
+        std::fs::set_permissions(parent, loose).unwrap();
+
+        let mut store = TokenStore::default();
+        store.set(
+            "https://mcp.example",
+            sample_entry(Some("https://as.example")),
+        );
+
+        let dir_mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "parent dir must be clamped to 0700");
     }
 
     #[test]

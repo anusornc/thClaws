@@ -51,6 +51,10 @@ impl AnthropicAgentProvider {
         self
     }
 
+    // All 4xx/5xx error paths in this provider funnel the response body
+    // through `super::redact_key(&text, &self.api_key)` before
+    // constructing an Error — Anthropic echoes the `x-api-key` header
+    // in some error responses.
     fn headers(&self) -> Vec<(&str, String)> {
         vec![
             ("x-api-key", self.api_key.clone()),
@@ -98,7 +102,10 @@ impl AnthropicAgentProvider {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!("create agent failed: {text}")));
+            return Err(Error::Provider(format!(
+                "create agent failed: {}",
+                super::redact_key(&text, &self.api_key)
+            )));
         }
 
         let v: Value = resp
@@ -136,7 +143,10 @@ impl AnthropicAgentProvider {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!("create session failed: {text}")));
+            return Err(Error::Provider(format!(
+                "create session failed: {}",
+                super::redact_key(&text, &self.api_key)
+            )));
         }
 
         let v: Value = resp
@@ -173,7 +183,10 @@ impl AnthropicAgentProvider {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!("send event failed: {text}")));
+            return Err(Error::Provider(format!(
+                "send event failed: {}",
+                super::redact_key(&text, &self.api_key)
+            )));
         }
         Ok(())
     }
@@ -209,7 +222,10 @@ impl Provider for AnthropicAgentProvider {
 
         if !stream_resp.status().is_success() {
             let text = stream_resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!("stream failed: {text}")));
+            return Err(Error::Provider(format!(
+                "stream failed: {}",
+                super::redact_key(&text, &self.api_key)
+            )));
         }
 
         // Send the user message.

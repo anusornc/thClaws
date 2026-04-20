@@ -133,6 +133,14 @@ const DOTENV_BLOCKLIST: &[&str] = &[
     "USER",
     "LOGNAME",
     "SHELL",
+    // Temp dir hijack (symlink races, predictable paths)
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Editor / pager invoked by git, less, man, gh, etc.
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
     // Network interception
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -143,6 +151,34 @@ const DOTENV_BLOCKLIST: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
+    // Language-runtime module injection. Each of these lets a `.env`
+    // pre-load arbitrary attacker-controlled code whenever a project
+    // tool spawns the corresponding interpreter.
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "RUBYOPT",
+    "RUBYLIB",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PERL5DB",
+    // Git tooling hijack — git spawns these for auth, remote ops, and
+    // to resolve its own helpers.
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_EXEC_PATH",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_TEMPLATE_DIR",
+    // SSH agent forwarding + askpass
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
     // thclaws internals an attacker could hijack
     "THCLAWS_MCP_ALLOW_ALL",
     "THCLAWS_CONFIG_DIR",
@@ -239,6 +275,34 @@ mod tests {
         // Cleanup.
         std::env::remove_var("TEST_DOTENV_A");
         std::env::remove_var("TEST_DOTENV_B");
+    }
+
+    #[test]
+    fn blocked_keys_cover_runtime_hijack_vectors() {
+        // Regression guard: every new runtime hijack vector added to
+        // DOTENV_BLOCKLIST should stay blocked.
+        for key in [
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "RUBYOPT",
+            "PERL5OPT",
+            "PERL5LIB",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_EXEC_PATH",
+            "SSH_ASKPASS",
+            "SSH_AUTH_SOCK",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "EDITOR",
+            "VISUAL",
+            "PAGER",
+        ] {
+            assert!(is_blocked_key(key), "{key} must be blocked");
+        }
     }
 
     #[test]

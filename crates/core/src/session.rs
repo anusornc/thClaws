@@ -331,8 +331,11 @@ impl SessionStore {
         if id.is_empty() {
             return Err(Error::Config("session id is empty".into()));
         }
-        if id.len() > 255 {
-            return Err(Error::Config("session id exceeds 255 characters".into()));
+        // POSIX filename cap is 255 bytes. With our `.jsonl` suffix
+        // (6 bytes) that leaves 249 for the id itself. Reject above
+        // that so we never produce a filename the filesystem refuses.
+        if id.len() > 249 {
+            return Err(Error::Config("session id exceeds 249 characters".into()));
         }
         let forbidden_chars = |c: char| matches!(c, '/' | '\\' | '\0') || c.is_control();
         if id.contains("..") || id.chars().any(forbidden_chars) {
