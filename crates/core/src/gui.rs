@@ -496,6 +496,17 @@ fn save_theme(mode: &str) {
     let _ = std::fs::write(path, serde_json::to_string_pretty(&payload).unwrap_or_default());
 }
 
+fn ospath(path: &str) -> String {
+    #[cfg(not(target_os = "windows"))]
+    {
+      return path.to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+      return path.replace("/", "\\");
+    }
+}
+
 /// Show a native OS confirmation dialog. Returns `true` on affirmative.
 ///
 /// Same shell-out pattern as `pick_directory_native`: osascript on macOS,
@@ -1580,7 +1591,8 @@ pub fn run_gui() {
                     }
                 }
                 "file_read" => {
-                    let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let raw_path = ospath(msg.get("path").and_then(|v| v.as_str()).unwrap_or(""));
+                  
                     // `mode` is optional. "preview" (default) renders .md
                     // to themed HTML; "source" returns the raw text so the
                     // frontend can hand it to a CodeMirror / TipTap editor.
@@ -1593,7 +1605,7 @@ pub fn run_gui() {
                     // caller omits the field.
                     let theme = msg.get("theme").and_then(|v| v.as_str()).unwrap_or("dark");
                     let theme = if theme == "light" { "light" } else { "dark" };
-                    match crate::sandbox::Sandbox::check(raw_path) {
+                    match crate::sandbox::Sandbox::check(&raw_path) {
                         Ok(path) => {
                             let ext = path.extension()
                                 .and_then(|e| e.to_str())
