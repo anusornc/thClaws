@@ -2874,6 +2874,11 @@
           "source": "derived:claude-opus-4-7",
           "verified_at": "2026-04-24"
         },
+        "agent/claude-opus-4-7-1m": {
+          "context": 1000000,
+          "source": "derived:claude-opus-4-7-1m",
+          "verified_at": "2026-04-27"
+        },
         "agent/claude-sonnet-4-6": {
           "context": 200000,
           "source": "derived:claude-sonnet-4-6",

@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-27
+
+Minor release. Provider expansion + agent-loop UX polish + a class
+of bugs around credential detection. Substantial accumulated work
+from same-day batch PR processing across 7 community contributors.
+
+### Added — Providers (4 new)
+
+- **Z.ai (GLM Coding Plan).** OpenAI-compatible upstream at
+  `https://api.z.ai/api/coding/paas/v4`. Routes via `zai/<id>`
+  prefix, default `zai/glm-4.6`. API key in `ZAI_API_KEY`. Power
+  users on the BigModel SKU can override via `ZAI_BASE_URL`.
+  Closes [#14](https://github.com/thClaws/thClaws/issues/14).
+- **LMStudio.** Local OpenAI-compatible runtime at `/v1`, default
+  `http://localhost:1234/v1`. No auth. User-configurable base URL
+  via Settings (mirrors the Ollama UX); env override
+  `LMSTUDIO_BASE_URL`.
+- **Azure AI Foundry** ([#21](https://github.com/thClaws/thClaws/pull/21),
+  Parinya-chab / joparin). Anthropic-Claude-on-Azure via
+  `{resource}/anthropic/v1/messages` with `x-api-key` auth. Reuses
+  `AnthropicProvider` with a custom base URL — no duplicate stream
+  code. Default model placeholder `azure/<deployment>` (Azure
+  deployments are user-named); set via
+  `/model azure/<your-deployment>` once `AZURE_AI_FOUNDRY_ENDPOINT`
+  + `AZURE_AI_FOUNDRY_API_KEY` are configured. Forward-looking
+  hooks added to `OpenAIProvider` (`with_api_key_header`,
+  `with_list_models_url`) for a future Azure OpenAI provider.
+- **Ollama Cloud** ([#28](https://github.com/thClaws/thClaws/pull/28),
+  Av0cadoo). Hits `https://ollama.com/api/chat` with Bearer auth;
+  reuses local Ollama's NDJSON parser. Round-trips the cloud-
+  specific `thinking` field as a sibling on assistant messages
+  (DeepSeek V4, Kimi K2.5, GLM-5, etc. emit reasoning content
+  separately from the visible answer). 38 cloud-only models
+  auto-discovered via the new catalogue-seed probe — including
+  `deepseek-v4-flash`, `kimi-k2.5/2.6`, `glm-5/5.1`,
+  `qwen3-coder-next`, `mistral-large-3:675b`, `gpt-oss:20b/120b`.
+  Closes [#17](https://github.com/thClaws/thClaws/issues/17).
+
+### Added — Agent-loop UX
+
+- **AskUserQuestion GUI bridge** ([#16](https://github.com/thClaws/thClaws/pull/16),
+  Kinzen-dev). The agent's `AskUser` tool used to fall through to
+  invisible CLI stdin in the GUI — chat hung indefinitely. The
+  question now appears as a chat-composer reply prompt; user
+  reply routes back through a `oneshot` to the awaiting tool call.
+  Falls back to CLI readline when no GUI is registered.
+- **macOS Cmd+Q / Cmd+W shutdown shortcuts** ([#16](https://github.com/thClaws/thClaws/pull/16)).
+  Two-layer coverage (frontend keydown listener + tao native
+  KeyboardInput) so Cmd+Q reaches the SaveAndQuit save path even
+  in fullscreen / focus-edge cases.
+- **Post-key-entry model picker** ([#13](https://github.com/thClaws/thClaws/issues/13)).
+  After successfully saving an API key in Settings, if the
+  provider has a non-trivial catalogue (≥3 models, skipping
+  runtime-loaded backends), a searchable modal opens so the user
+  can pick a default model.
+- **`/model` interactive picker on no-args** ([#25](https://github.com/thClaws/thClaws/issues/25),
+  tkvision). Typing `/model` with no arguments now opens the
+  same picker modal in addition to printing the current model.
+  Reuses the post-key picker's UX. CLI-side TUI picker is a future
+  follow-up.
+- **Slash-command popup** ([#20](https://github.com/thClaws/thClaws/pull/20),
+  siharat-th). Typing `/` in chat or terminal opens an
+  autocomplete menu — built-in commands grouped by category
+  (Session / Model / Context / Extensions / Team / System), plus
+  user `.claude/commands/` and installed skills. Arrow keys
+  navigate, Tab/Enter accept, Esc cancels. Smart Enter: only
+  swallows Enter while composing the command name, falls through
+  to submit once arguments are being typed.
+- **Terminal caret-aware editing** ([#22](https://github.com/thClaws/thClaws/pull/22),
+  siharat-th). Left/Right arrow keys, Home/End, Ctrl-A/Ctrl-E
+  navigate the line buffer instead of echoing escape codes.
+  Backspace and printable-char insertion are caret-aware: the
+  fast `term.write(ch)` / `\b \b` path stays at end-of-line;
+  mid-line edits redraw so the tail shifts correctly.
+
+### Added — Catalogue
+
+- **`agent/claude-opus-4-7-1m`** in the agent-sdk catalogue
+  ([#26](https://github.com/thClaws/thClaws/issues/26), tkvision).
+  Max-subscription users on the `agent/*` provider can now
+  explicitly select the 1M-context Opus variant.
+- **Ollama Cloud auto-discovery** in `catalogue-seed`. Probes
+  `https://ollama.com/v1/models` when `OLLAMA_CLOUD_API_KEY` is
+  set; refreshes 38 cloud rows every run.
+- **`load_dotenv_walking_up()`** in `catalogue-seed` — walks up
+  from cwd to find a workspace-root `.env`, so the operator tool
+  picks up API keys regardless of which directory cargo is invoked
+  from.
+
+### Changed
+
+- **Default Gemini model** `gemini-2.0-flash` → `gemini-2.5-flash`
+  ([#27](https://github.com/thClaws/thClaws/pull/27), gokusenz).
+  Google's deprecation page lists 2.0-flash as deprecated with
+  shutdown 2026-06-01. Existing user configs that explicitly pin
+  2.0-flash still work.
+- **Read tool** now errors out clearly when bytes don't match any
+  supported image format (PNG/JPEG/WebP/GIF) instead of guessing
+  the MIME from the extension. Real images sniff fine; only the
+  wrong-extension/corrupted unhappy path changes.
+
+### Fixed
+
+- **Empty `ANTHROPIC_API_KEY=""` (or any provider key) was treated
+  as configured.** `std::env::var(...).is_ok()` returns true for
+  an exported-but-empty value, so a stale shell rc / VS Code env
+  injection blocked `auto_fallback_model` from switching when the
+  user added a Gemini/Z.ai/etc. key. Both `kind_has_credentials`
+  and `api_key_from_env` now require non-empty values; empty env
+  falls through to the keychain. Includes a regression test
+  `empty_env_var_treated_as_unset`.
+- **`/exit` / `/quit` / `/q` slash commands** route through
+  the backend `app_close` save path
+  ([#16](https://github.com/thClaws/thClaws/pull/16)) instead of
+  frontend-only `window.close()` after a 200 ms timeout.
+- **Tool-bubble finalizer** searches backwards for the most recent
+  unfinished tool bubble — handles text events arriving between
+  `tool_use` and `tool_done`
+  ([#16](https://github.com/thClaws/thClaws/pull/16)).
+- **Frontend security hardening** from a same-day audit pass:
+  10 MB cap on pasted/dropped images with inline error banner
+  (was: silent drop, multi-MB paste froze the UI during base64
+  encoding); 1 MB cap on terminal clipboard paste; explanatory
+  threat-model comment on the `ReactMarkdown` call site;
+  `ansiToHtml` documented invariant block.
+- **Backend security hardening:** IPC `chat_user_message`
+  attachment array bounded at `MAX_ATTACHMENTS_PER_MESSAGE = 10`
+  + 67 MB total b64.
+
+### Infrastructure
+
+- **Branch protection ruleset on `main`** — block force-push +
+  deletion (non-admin), require PR before merging, require status
+  checks (cargo fmt + clippy + test (ubuntu-latest) + audit) to
+  pass. Admin bypass for sync-from-private-workspace flow and
+  emergency corrections.
+- **Private Vulnerability Reporting (PVR)** enabled. SECURITY.md
+  refreshed: PVR primary, email alternate, supported versions
+  bumped 0.2.x → 0.3.x → 0.4.x.
+- **CodeQL default setup** for JavaScript/TypeScript + Actions.
+- **`cargo-audit` workflow** runs on PRs touching `Cargo.lock` +
+  weekly cron.
+- **Node 24 actions runtime opt-in** via
+  `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` ahead of GitHub's
+  2026-06-02 forced switch.
+- **`ci.yml` permissions block** — `contents: read, actions: read`
+  at top level (was inheriting GITHUB_TOKEN's default write
+  scope; closes 4 CodeQL alerts).
+
+### Acknowledged but deferred
+
+- Copy-button-on-chat-bubble surface scope decision (toast / scope
+  restriction / pattern-redaction) — captured in the audit reports
+  under `dev-log/103-security-audit-frontend.md`.
+- IPC message types still stringly-typed; discriminated-union
+  refactor queued.
+- Transitive `glib` 0.18.5 / gtk-rs 0.18.x unmaintained warnings
+  remain pending the upstream `wry`/`webkit2gtk` GTK4 migration.
+- CLI TUI picker for `/model` no-args
+  ([#25](https://github.com/thClaws/thClaws/issues/25)) — GUI
+  side ships in this release; CLI is future work.
+- GitHub Copilot provider
+  ([#24](https://github.com/thClaws/thClaws/issues/24)) — needs
+  GitHub OAuth web flow; queued for a future minor.
+- `output.log` should record tool-call argument detail
+  ([#23](https://github.com/thClaws/thClaws/issues/23)).
+
 ## [0.3.5] — 2026-04-26
 
 Same-day feature/fix follow-up to v0.3.4: two new providers, the

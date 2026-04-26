@@ -154,6 +154,13 @@ pub enum ViewEvent {
     /// Emitted after `/kms new | use | off` so the sidebar reflects
     /// the new state without waiting for the next full session_update.
     KmsUpdate(String),
+    /// Open the GUI's interactive model picker — pre-built JSON payload
+    /// shaped like `{type: "model_picker_open", provider, current,
+    /// models: [{id, context, max_output}, ...]}`. Emitted by the
+    /// `/model` slash command when invoked without arguments (#25).
+    /// The CLI renderer ignores this — a CLI TUI picker is a future
+    /// follow-up.
+    ModelPickerOpen(String),
     /// The session's on-disk JSONL has crossed the fork threshold.
     /// Frontend renders a dismissible banner with a "Fork into new
     /// session with summary" action. Fired once per session.

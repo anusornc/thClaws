@@ -324,10 +324,48 @@ pub async fn dispatch(
             let arg = arg.trim();
             if arg.is_empty() {
                 let prov = state.config.detect_provider().unwrap_or("unknown");
+                // Always print the current model — keeps `/model` useful
+                // as an introspection command and degrades gracefully on
+                // CLI where the picker isn't (yet) rendered.
                 emit(
                     events_tx,
                     format!("model: {} (provider: {})", state.config.model, prov),
                 );
+                // GUI side: also broadcast a model_picker_open event so
+                // the existing ModelPickerModal opens with the active
+                // provider's catalogue. Skipped for tiny catalogues
+                // (<3 entries — no choice to make) and runtime-loaded
+                // backends (Ollama / LMStudio) whose model lists come
+                // from the live runtime, not the catalogue. Closes #25.
+                let runtime_loaded = matches!(
+                    prov,
+                    "ollama" | "ollama-anthropic" | "lmstudio",
+                );
+                if !runtime_loaded {
+                    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+                    let models = cat.list_models_for_provider(prov);
+                    if models.len() >= 3 {
+                        let model_rows: Vec<serde_json::Value> = models
+                            .iter()
+                            .map(|(id, e)| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "context": e.context,
+                                    "max_output": e.max_output,
+                                })
+                            })
+                            .collect();
+                        let payload = serde_json::json!({
+                            "type": "model_picker_open",
+                            "provider": prov,
+                            "current": state.config.model,
+                            "models": model_rows,
+                        });
+                        let _ = events_tx.send(ViewEvent::ModelPickerOpen(
+                            payload.to_string(),
+                        ));
+                    }
+                }
             } else {
                 // Strict mode: user named a specific model. A typo
                 // should abort so they don't end up on the wrong one.

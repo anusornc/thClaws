@@ -184,6 +184,7 @@ fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::SessionListRefresh(json) => vec![json.clone()],
         ViewEvent::ProviderUpdate(json) => vec![json.clone()],
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
+        ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
         ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
             "type": "chat_context_warning",
             "file_size_mb": file_size_mb,
@@ -378,6 +379,7 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
         ViewEvent::SessionListRefresh(_) => None,
         ViewEvent::ProviderUpdate(_) => None,
         ViewEvent::KmsUpdate(_) => None,
+        ViewEvent::ModelPickerOpen(_) => None,
         ViewEvent::ContextWarning { file_size_mb } => Some(format!(
             "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
             file_size_mb
