@@ -6,7 +6,7 @@
 //! the returned string back as a `ContentBlock::ToolResult`.
 
 use crate::error::{Error, Result};
-use crate::types::ToolDef;
+use crate::types::{ToolDef, ToolResultContent};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -47,6 +47,14 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &'static str;
     fn input_schema(&self) -> Value;
     async fn call(&self, input: Value) -> Result<String>;
+
+    /// Multimodal variant. Override for tools that produce non-text
+    /// artifacts (Read on image files, future image-generation tools,
+    /// etc.). The default impl wraps `call()`'s string output as Text,
+    /// so existing tools need no changes.
+    async fn call_multimodal(&self, input: Value) -> Result<ToolResultContent> {
+        self.call(input).await.map(ToolResultContent::Text)
+    }
 
     /// Whether this tool requires user approval before execution when the
     /// permission mode is `Ask`. Default: false (read-only). Override for

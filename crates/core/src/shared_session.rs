@@ -72,6 +72,15 @@ pub enum ShellInput {
     /// Raw line submitted by the user. Slash-prefix → dispatched as
     /// command, anything else → fed to the agent as a prompt.
     Line(String),
+    /// Like `Line` but with one or more inline image attachments
+    /// (paste / drag-drop into the chat composer). Each attachment is
+    /// `(media_type, base64_data)`. Slash commands aren't expected
+    /// here — the GUI only emits this when an image is attached, and
+    /// it doesn't make sense to combine a slash command with images.
+    LineWithImages {
+        text: String,
+        images: Vec<(String, String)>,
+    },
     /// Save the current session to disk, clear history, start fresh.
     NewSession,
     /// Load a session by id and replace history.
@@ -162,40 +171,61 @@ pub struct DisplayMessage {
 
 impl DisplayMessage {
     pub fn from_messages(messages: &[Message]) -> Vec<Self> {
-        messages
-            .iter()
-            .filter_map(|m| {
-                let role = match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::System => return None,
-                };
-                let content: Vec<String> = m
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        // Reasoning is model-internal scratch — don't show
-                        // it in the chat-list display. When the GUI gets a
-                        // dedicated "show thinking" toggle, surface this
-                        // there instead of the main bubble.
-                        ContentBlock::Thinking { .. } => None,
-                        ContentBlock::ToolUse { name, .. } => Some(format!("[tool: {name}]")),
-                        ContentBlock::ToolResult { content, .. } => {
-                            let snippet: String = content.chars().take(200).collect();
-                            Some(format!("[result: {snippet}]"))
-                        }
-                    })
-                    .collect();
-                if content.is_empty() {
-                    return None;
+        let mut out: Vec<DisplayMessage> = Vec::new();
+        for m in messages {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                // System prompts never render as chat bubbles.
+                Role::System => continue,
+            };
+
+            // Walk content blocks. Text accumulates into a single bubble
+            // for this canonical message; ToolUse blocks emit their own
+            // `tool` entries (so they render the same compact ▸/✓
+            // indicator as live AgentEvent::ToolCallStart in ChatView);
+            // ToolResult is dropped entirely — the chat tab is for the
+            // user↔assistant exchange, raw tool output lives on the
+            // Terminal tab.
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut deferred_tools: Vec<DisplayMessage> = Vec::new();
+            for b in &m.content {
+                match b {
+                    ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    // Reasoning is model-internal scratch — don't show
+                    // it in the chat-list display. When the GUI gets a
+                    // dedicated "show thinking" toggle, surface this
+                    // there instead of the main bubble.
+                    ContentBlock::Thinking { .. } => {}
+                    ContentBlock::ToolUse { name, .. } => {
+                        deferred_tools.push(DisplayMessage {
+                            role: "tool".into(),
+                            content: name.clone(),
+                        });
+                    }
+                    // Tool results don't surface on history restore.
+                    ContentBlock::ToolResult { .. } => {}
+                    // Inline image attached by the user (paste /
+                    // drag-drop). Render as a brief placeholder in
+                    // the chat-list digest; the actual pixels stay
+                    // in the underlying ContentBlock for the model.
+                    ContentBlock::Image { .. } => text_parts.push("[image]".into()),
                 }
-                Some(DisplayMessage {
+            }
+
+            // Emit text bubble first (if any), then any tool indicators
+            // — preserves the live-mode ordering where the assistant's
+            // narration appears before the tool calls it triggered.
+            let text = text_parts.join("\n");
+            if !text.is_empty() {
+                out.push(DisplayMessage {
                     role: role.to_string(),
-                    content: content.join("\n"),
-                })
-            })
-            .collect()
+                    content: text,
+                });
+            }
+            out.extend(deferred_tools);
+        }
+        out
     }
 }
 
@@ -656,6 +686,10 @@ async fn run_worker(
                 cancel.store(false, Ordering::Relaxed);
                 handle_line(text, &mut state, &events_tx, &cancel).await;
             }
+            ShellInput::LineWithImages { text, images } => {
+                cancel.store(false, Ordering::Relaxed);
+                handle_line_with_images(text, images, &mut state, &events_tx, &cancel).await;
+            }
             ShellInput::NewSession => {
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 state.agent.clear_history();
@@ -965,7 +999,85 @@ async fn handle_line(
     let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
     let _ = lead_mb.write_status("lead", "working", None);
 
-    let mut stream = Box::pin(state.agent.run_turn(trimmed.to_string()));
+    let stream = Box::pin(state.agent.run_turn(trimmed.to_string()));
+    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+}
+
+/// Multipart variant of `handle_line` — used when the chat composer
+/// attaches one or more images to a user message (Phase 4 paste/drag-
+/// drop). Skips slash-command dispatch (a slash command + image makes
+/// no sense) and feeds a mixed Text + Image content vec into the
+/// agent's `run_turn_multipart`.
+async fn handle_line_with_images(
+    text: String,
+    images: Vec<(String, String)>,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cancel: &Arc<AtomicBool>,
+) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() && images.is_empty() {
+        return;
+    }
+
+    // Display digest for the chat-list — show the user's text plus a
+    // compact "[+N image(s)]" tail so they see what they actually sent.
+    let display = if images.is_empty() {
+        trimmed.to_string()
+    } else if trimmed.is_empty() {
+        format!(
+            "[{} image{}]",
+            images.len(),
+            if images.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{trimmed} [+{} image{}]",
+            images.len(),
+            if images.len() == 1 { "" } else { "s" }
+        )
+    };
+    let _ = events_tx.send(ViewEvent::UserPrompt(display.clone()));
+    write_lead_log(
+        &state.lead_log,
+        &format!("\n\x1b[36m❯ {display}\x1b[0m\n\x1b[32m"),
+    );
+
+    maybe_auto_compact(state, events_tx);
+
+    let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+    let _ = lead_mb.write_status("lead", "working", None);
+
+    // Build the user message: text first (if any), then one Image
+    // block per attachment. Some providers (Anthropic) prefer images
+    // before text for cache efficiency, but the agent's history is
+    // logical — providers serialize whatever order is best for them.
+    let mut user_content: Vec<ContentBlock> = Vec::new();
+    if !trimmed.is_empty() {
+        user_content.push(ContentBlock::text(trimmed));
+    }
+    for (media_type, data) in images {
+        user_content.push(ContentBlock::Image {
+            source: crate::types::ImageSource::Base64 { media_type, data },
+        });
+    }
+
+    let stream = Box::pin(state.agent.run_turn_multipart(user_content));
+    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+}
+
+/// Drive an agent run_turn stream to completion, emitting ViewEvents
+/// to both the chat and terminal tabs. Extracted so handle_line and
+/// handle_line_with_images share the streaming loop unchanged.
+async fn drive_turn_stream(
+    mut stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<AgentEvent, crate::error::Error>> + Send>,
+    >,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cancel: &Arc<AtomicBool>,
+    lead_mb: &crate::team::Mailbox,
+) {
     while let Some(ev) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
             let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));

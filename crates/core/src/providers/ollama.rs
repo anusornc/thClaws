@@ -134,13 +134,25 @@ impl OllamaProvider {
                     // Drop the block — it stays in our local history but
                     // doesn't go on the wire.
                     ContentBlock::Thinking { .. } => {}
+                    // Ollama's stock chat API doesn't support
+                    // image attachments either (vision models like
+                    // llava use a separate `images: [...]` field that
+                    // we don't yet plumb). Drop the block on the wire
+                    // for now — it stays in local history so a future
+                    // turn against an Anthropic / OpenAI / Gemini
+                    // model still sees it.
+                    ContentBlock::Image { .. } => {}
                     ContentBlock::ToolUse { name, input, .. } => {
                         tool_calls.push(json!({
                             "function": { "name": name, "arguments": input },
                         }));
                     }
                     ContentBlock::ToolResult { content, .. } => {
-                        trailing_tool_results.push(content.clone());
+                        // Ollama is text-only; flatten any multimodal
+                        // blocks via to_text() so the Read-an-image
+                        // path doesn't 500 — the model gets the
+                        // accompanying text summary instead of pixels.
+                        trailing_tool_results.push(content.to_text());
                     }
                 }
             }

@@ -45,15 +45,100 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+    },
+    /// Inline image attached directly to a user message (paste / drag-drop
+    /// in the chat composer). Distinct from images returned by the Read
+    /// tool, which ride inside `ToolResult.content` as `ToolResultBlock::Image`
+    /// — both wrap the same `ImageSource` payload, but the agent loop
+    /// treats user-attached images as part of the prompt rather than a
+    /// tool result. Vision-capable Anthropic / OpenAI / Gemini models
+    /// receive the pixels directly; non-vision models see this block
+    /// flattened to nothing (the sibling Text block carries the text).
+    Image {
+        source: ImageSource,
     },
 }
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
         ContentBlock::Text { text: s.into() }
+    }
+}
+
+/// Where an image's bytes come from. Today only inline base64; future
+/// variants (URL, file-asset reference) plug in here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Base64 { media_type: String, data: String },
+}
+
+/// One element of a multimodal `tool_result` content array. Mirrors the
+/// nested-content shape the Anthropic API accepts for tool_results that
+/// carry image attachments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultBlock {
+    Text { text: String },
+    Image { source: ImageSource },
+}
+
+/// A tool's returned content. Either a plain string (the common case —
+/// every existing tool falls here via `From<String>`) or a sequence of
+/// mixed text/image blocks (the Read tool on an image file).
+///
+/// `#[serde(untagged)]` so it serializes as either `"content": "..."`
+/// or `"content": [...]` — both are valid Anthropic wire shapes for a
+/// tool_result, so the Anthropic provider gets multimodal support
+/// "for free" via this enum's serde representation. Other providers
+/// flatten via `to_text()` until they grow their own image handling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ToolResultBlock>),
+}
+
+impl From<String> for ToolResultContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for ToolResultContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl ToolResultContent {
+    /// Plain-text rendering for callers that can't display images
+    /// (history list, compaction, OpenAI/Gemini/etc. before they grow
+    /// multimodal support). Image blocks render as nothing — the Read
+    /// tool always pairs each Image with a Text summary block, so the
+    /// summary still reaches the model.
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ToolResultBlock::Text { text } => Some(text.as_str()),
+                    ToolResultBlock::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(s) => s.is_empty(),
+            Self::Blocks(blocks) => blocks.is_empty(),
+        }
     }
 }
 
@@ -162,5 +247,105 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         let back: Message = serde_json::from_str(&s).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn tool_result_text_serializes_as_string() {
+        // Existing wire shape — must stay a bare string so v0.3.1
+        // sessions deserialize unchanged after the v0.3.2 type change.
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".into(),
+            content: "ok".into(),
+            is_error: false,
+        };
+        let j = serde_json::to_value(&block).unwrap();
+        assert_eq!(j["content"], serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn tool_result_blocks_serialize_as_array_anthropic_shape() {
+        // Multimodal wire shape — array of typed sub-blocks. Anthropic
+        // accepts this natively for tool_results that carry images.
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".into(),
+            content: ToolResultContent::Blocks(vec![
+                ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                },
+                ToolResultBlock::Text {
+                    text: "image: x.png".into(),
+                },
+            ]),
+            is_error: false,
+        };
+        let j = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            j["content"],
+            serde_json::json!([
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+                },
+                {"type": "text", "text": "image: x.png"}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_content_roundtrips_both_shapes() {
+        let s_text = serde_json::to_string(&ToolResultContent::Text("hi".into())).unwrap();
+        assert_eq!(s_text, "\"hi\"");
+        let back_text: ToolResultContent = serde_json::from_str(&s_text).unwrap();
+        assert!(matches!(back_text, ToolResultContent::Text(ref s) if s == "hi"));
+
+        let blocks = ToolResultContent::Blocks(vec![ToolResultBlock::Text { text: "hi".into() }]);
+        let s_blocks = serde_json::to_string(&blocks).unwrap();
+        let back_blocks: ToolResultContent = serde_json::from_str(&s_blocks).unwrap();
+        assert!(matches!(back_blocks, ToolResultContent::Blocks(ref v) if v.len() == 1));
+    }
+
+    #[test]
+    fn content_block_image_serializes_anthropic_native_shape() {
+        // ContentBlock::Image used directly in a user message —
+        // serializes via the existing #[serde(tag = "type")] machinery.
+        // Anthropic's user-content array accepts this exact shape, so
+        // the provider needs zero extra serialization code.
+        let block = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
+        };
+        let j = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+            })
+        );
+    }
+
+    #[test]
+    fn to_text_drops_image_blocks_keeps_text() {
+        let c = ToolResultContent::Blocks(vec![
+            ToolResultBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "ZZZ".into(),
+                },
+            },
+            ToolResultBlock::Text {
+                text: "summary line".into(),
+            },
+        ]);
+        // Image renders as nothing, sibling text carries the meaning —
+        // so providers that flatten via to_text() (OpenAI/Gemini/Ollama
+        // before they grow image support) still get the descriptive
+        // text the model needs.
+        assert_eq!(c.to_text(), "summary line");
     }
 }

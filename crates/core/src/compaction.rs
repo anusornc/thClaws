@@ -23,7 +23,14 @@ pub fn estimate_message_tokens(m: &Message) -> usize {
                 chunks.push(name.clone());
                 chunks.push(input.to_string());
             }
-            ContentBlock::ToolResult { content, .. } => chunks.push(content.clone()),
+            ContentBlock::ToolResult { content, .. } => chunks.push(content.to_text()),
+            // Vision input billing on Anthropic / OpenAI / Gemini lands
+            // around ~258 tokens for a typical screenshot-sized image
+            // (1568px max edge). We bake that as a fixed estimate so
+            // the compactor's budget math doesn't ignore attached
+            // images entirely — accuracy isn't critical here, just
+            // "does it cross the threshold."
+            ContentBlock::Image { .. } => chunks.push("x".repeat(258 * 4)),
         }
     }
     estimate_tokens(&chunks.join(" "))
@@ -175,9 +182,17 @@ fn render_for_summary(messages: &[Message]) -> String {
                     content, is_error, ..
                 } => {
                     let prefix = if *is_error { "Error" } else { "Result" };
-                    let preview: String = content.chars().take(500).collect();
+                    let preview: String = content.to_text().chars().take(500).collect();
                     Some(format!("[{prefix}: {preview}]"))
                 }
+                // User-attached images are summarized as a placeholder
+                // in compaction notes; the actual pixels stay in the
+                // un-compacted prefix the model still has access to.
+                ContentBlock::Image { source, .. } => match source {
+                    crate::types::ImageSource::Base64 { media_type, .. } => {
+                        Some(format!("[Image attached: {media_type}]"))
+                    }
+                },
             })
             .collect::<Vec<_>>()
             .join("\n");

@@ -18,7 +18,7 @@
 
 use super::{EventStream, ModelInfo, Provider, ProviderEvent, StreamRequest, Usage};
 use crate::error::{Error, Result};
-use crate::types::{ContentBlock, Role};
+use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -60,6 +60,11 @@ impl OpenAIProvider {
 
     /// Convert canonical `Message`s → OpenAI chat/completions messages array.
     /// Splits ToolResult blocks out as separate `role: "tool"` messages.
+    /// When a ToolResult carries inline images (Read on a PNG, etc.), an
+    /// extra `role: "user"` message with image_url blocks is appended
+    /// after the tool message — OpenAI's tool-role messages are
+    /// text-only, so this is the documented pattern for getting
+    /// tool-returned imagery in front of a vision-capable model.
     fn messages_to_openai(req: &StreamRequest) -> Vec<Value> {
         let mut out: Vec<Value> = Vec::new();
         let echo_reasoning = model_uses_reasoning_content(&req.model);
@@ -80,7 +85,19 @@ impl OpenAIProvider {
             let mut text_parts: Vec<String> = Vec::new();
             let mut thinking_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<Value> = Vec::new();
-            let mut trailing_tool_results: Vec<(String, String)> = Vec::new();
+            // (tool_call_id, text_content, images-from-this-result).
+            // Each image is (media_type, base64_data) and gets emitted
+            // as a follow-up synthetic user message with image_url
+            // blocks — OpenAI's tool-role messages are text-only, so a
+            // separate user message is the documented pattern for
+            // getting tool-returned imagery in front of a vision model.
+            let mut trailing_tool_results: Vec<(String, String, Vec<(String, String)>)> =
+                Vec::new();
+            // Inline images attached directly to a user message
+            // (Phase 4 paste/drag-drop). Held separately so the
+            // emit-step below can switch to OpenAI's array-form
+            // content shape only when there's actually an image.
+            let mut inline_user_images: Vec<(String, String)> = Vec::new();
 
             for block in &m.content {
                 match block {
@@ -95,6 +112,11 @@ impl OpenAIProvider {
                             thinking_parts.push(content.clone());
                         }
                     }
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 { media_type, data },
+                    } => {
+                        inline_user_images.push((media_type.clone(), data.clone()));
+                    }
                     ContentBlock::ToolUse { id, name, input } => {
                         let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
                         tool_calls.push(json!({
@@ -108,7 +130,14 @@ impl OpenAIProvider {
                         content,
                         ..
                     } => {
-                        trailing_tool_results.push((tool_use_id.clone(), content.clone()));
+                        // Tool message itself is text-only — extract the
+                        // text portions via to_text(). Any images get
+                        // queued for the synthetic user message that
+                        // follows the tool message (see the emission
+                        // loop below).
+                        let text = content.to_text();
+                        let images = extract_images(content);
+                        trailing_tool_results.push((tool_use_id.clone(), text, images));
                     }
                 }
             }
@@ -118,10 +147,29 @@ impl OpenAIProvider {
             let has_text = !content_text.is_empty();
             let has_reasoning = !reasoning_text.is_empty();
             let has_tools = !tool_calls.is_empty();
+            let has_inline_images = !inline_user_images.is_empty();
 
-            if has_text || has_tools || has_reasoning {
+            if has_text || has_tools || has_reasoning || has_inline_images {
                 let mut msg = json!({"role": role});
-                if has_text {
+                if has_inline_images {
+                    // Mixed text + image_url content array. OpenAI
+                    // requires this shape any time an image_url
+                    // block appears, even if a string would otherwise
+                    // suffice for the same role + text.
+                    let mut content_arr: Vec<Value> = Vec::new();
+                    if has_text {
+                        content_arr.push(json!({"type": "text", "text": content_text}));
+                    }
+                    for (media_type, data) in &inline_user_images {
+                        content_arr.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{media_type};base64,{data}")
+                            }
+                        }));
+                    }
+                    msg["content"] = json!(content_arr);
+                } else if has_text {
                     msg["content"] = json!(content_text);
                 } else if has_tools {
                     msg["content"] = Value::Null;
@@ -135,11 +183,64 @@ impl OpenAIProvider {
                 out.push(msg);
             }
 
-            for (tool_call_id, content) in trailing_tool_results {
+            // Emit ALL tool messages back-to-back first. OpenAI's
+            // contract: an assistant message with `tool_calls` must
+            // be followed by tool-role messages responding to every
+            // tool_call_id, with no other roles interleaved. An
+            // earlier (broken) version of this code emitted a
+            // synthetic user message after each individual tool
+            // message — fine for one tool call but a 400 from the
+            // server when the model batched N parallel calls
+            // ("tool_call_ids did not have response messages").
+            for (tool_call_id, content, _images) in &trailing_tool_results {
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": content,
+                }));
+            }
+            // Then ONE combined synthetic user message carrying every
+            // image returned by any of those tool calls — text labels
+            // tag each image_url with its originating tool_call_id so
+            // the model can correlate. This is the documented OpenAI
+            // pattern for getting tool-returned imagery in front of a
+            // vision-capable model. The user must select a vision-
+            // capable model (gpt-4o, gpt-4o-mini, …); non-vision
+            // models will 400 with a clear server error.
+            let total_images: usize = trailing_tool_results.iter().map(|(_, _, i)| i.len()).sum();
+            if total_images > 0 {
+                let mut user_content: Vec<Value> = Vec::with_capacity(total_images * 2 + 1);
+                let call_ids: Vec<&str> = trailing_tool_results
+                    .iter()
+                    .filter(|(_, _, i)| !i.is_empty())
+                    .map(|(id, _, _)| id.as_str())
+                    .collect();
+                user_content.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "(image{} attached from preceding tool_result{}: {})",
+                        if total_images == 1 { "" } else { "s" },
+                        if call_ids.len() == 1 { "" } else { "s" },
+                        call_ids.join(", ")
+                    ),
+                }));
+                for (tool_call_id, _content, images) in &trailing_tool_results {
+                    for (media_type, data) in images {
+                        user_content.push(json!({
+                            "type": "text",
+                            "text": format!("from {tool_call_id}:"),
+                        }));
+                        user_content.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{media_type};base64,{data}")
+                            }
+                        }));
+                    }
+                }
+                out.push(json!({
+                    "role": "user",
+                    "content": user_content,
                 }));
             }
         }
@@ -174,6 +275,25 @@ impl OpenAIProvider {
             body["tools"] = json!(tools);
         }
         body
+    }
+}
+
+/// Extract `(media_type, base64_data)` pairs from a ToolResultContent.
+/// Returns empty for the Text variant or for Blocks containing no
+/// images. Used by `messages_to_openai` to decide whether to emit a
+/// follow-up synthetic user message carrying image_url blocks.
+fn extract_images(content: &ToolResultContent) -> Vec<(String, String)> {
+    match content {
+        ToolResultContent::Text(_) => Vec::new(),
+        ToolResultContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                ToolResultBlock::Image {
+                    source: ImageSource::Base64 { media_type, data },
+                } => Some((media_type.clone(), data.clone())),
+                ToolResultBlock::Text { .. } => None,
+            })
+            .collect(),
     }
 }
 
@@ -717,6 +837,303 @@ mod tests {
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_1");
         assert_eq!(msgs[3]["content"], "hello file");
+    }
+
+    #[test]
+    fn messages_to_openai_image_tool_result_emits_synthetic_user_message() {
+        // ToolResult with Blocks (Image + Text) — OpenAI's tool-role
+        // message must stay text-only (the summary), and a synthetic
+        // user message with an image_url block must follow so a
+        // vision-capable model can actually see the pixels.
+        use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
+        let req = StreamRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_2".into(),
+                        name: "Read".into(),
+                        input: json!({"path": "/tmp/x.png"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_2".into(),
+                        content: ToolResultContent::Blocks(vec![
+                            ToolResultBlock::Image {
+                                source: ImageSource::Base64 {
+                                    media_type: "image/png".into(),
+                                    data: "AAAA".into(),
+                                },
+                            },
+                            ToolResultBlock::Text {
+                                text: "image: x.png · 1 KB · image/png".into(),
+                            },
+                        ]),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let msgs = OpenAIProvider::messages_to_openai(&req);
+        // assistant(tool_use), tool(text-only summary), user(image_url)
+        assert_eq!(msgs.len(), 3, "expected 3 wire messages, got {msgs:#?}");
+
+        // Tool message: text-only summary, NOT the image bytes.
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_2");
+        assert_eq!(msgs[1]["content"], "image: x.png · 1 KB · image/png");
+
+        // Synthetic user message: intro text + per-image label +
+        // image_url block. The intro names the originating call_id;
+        // the per-image label "from <call_id>:" repeats it inline so
+        // the model can correlate when there are multiple images.
+        assert_eq!(msgs[2]["role"], "user");
+        let user_content = msgs[2]["content"].as_array().expect("user content array");
+        assert_eq!(
+            user_content.len(),
+            3,
+            "expected intro text + image label + image_url block"
+        );
+        assert_eq!(user_content[0]["type"], "text");
+        assert!(
+            user_content[0]["text"].as_str().unwrap().contains("call_2"),
+            "user-message intro should reference originating tool_call_id"
+        );
+        assert_eq!(user_content[1]["type"], "text");
+        assert!(user_content[1]["text"].as_str().unwrap().contains("call_2"));
+        assert_eq!(user_content[2]["type"], "image_url");
+        assert_eq!(
+            user_content[2]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn messages_to_openai_batched_image_tool_results_emit_tool_messages_back_to_back() {
+        // Regression for the v0.3.2-dev image attachment bug: when the
+        // model batches N parallel Read calls and each result carries
+        // an image, OpenAI's contract requires ALL tool messages to
+        // immediately follow the assistant's tool_calls, with no other
+        // roles interleaved. The previous (broken) emission inserted
+        // a synthetic user message after each individual tool message,
+        // producing an assistant→tool→user→tool→user→... shape that
+        // OpenAI rejects with `tool_call_ids did not have response
+        // messages: ...`.
+        //
+        // Correct shape: assistant → tool × N → user (combined images).
+        use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
+        let req = StreamRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![
+                // Assistant batches 3 Read calls in one turn.
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: "call_a".into(),
+                            name: "Read".into(),
+                            input: json!({"path": "/tmp/a.png"}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_b".into(),
+                            name: "Read".into(),
+                            input: json!({"path": "/tmp/b.png"}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_c".into(),
+                            name: "Read".into(),
+                            input: json!({"path": "/tmp/c.png"}),
+                        },
+                    ],
+                },
+                // User message carries 3 ToolResults (one per call).
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_a".into(),
+                            content: ToolResultContent::Blocks(vec![
+                                ToolResultBlock::Image {
+                                    source: ImageSource::Base64 {
+                                        media_type: "image/png".into(),
+                                        data: "AAA".into(),
+                                    },
+                                },
+                                ToolResultBlock::Text {
+                                    text: "image: a.png".into(),
+                                },
+                            ]),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_b".into(),
+                            content: ToolResultContent::Blocks(vec![
+                                ToolResultBlock::Image {
+                                    source: ImageSource::Base64 {
+                                        media_type: "image/png".into(),
+                                        data: "BBB".into(),
+                                    },
+                                },
+                                ToolResultBlock::Text {
+                                    text: "image: b.png".into(),
+                                },
+                            ]),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_c".into(),
+                            content: ToolResultContent::Blocks(vec![
+                                ToolResultBlock::Image {
+                                    source: ImageSource::Base64 {
+                                        media_type: "image/png".into(),
+                                        data: "CCC".into(),
+                                    },
+                                },
+                                ToolResultBlock::Text {
+                                    text: "image: c.png".into(),
+                                },
+                            ]),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let msgs = OpenAIProvider::messages_to_openai(&req);
+
+        // Expected sequence:
+        //   [0] assistant {tool_calls: [a, b, c]}
+        //   [1] tool      tool_call_id=call_a
+        //   [2] tool      tool_call_id=call_b
+        //   [3] tool      tool_call_id=call_c
+        //   [4] user      [text intro, label_a, img_a, label_b, img_b, label_c, img_c]
+        assert_eq!(msgs.len(), 5, "expected 5 wire messages, got {msgs:#?}");
+
+        // Three tool messages back-to-back, in input order.
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_a");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_b");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_c");
+
+        // ONE combined synthetic user message after the tool batch.
+        assert_eq!(msgs[4]["role"], "user");
+        let user_content = msgs[4]["content"].as_array().expect("user content array");
+        // 1 intro + (label + image_url) × 3 = 7 blocks
+        assert_eq!(user_content.len(), 7);
+        assert_eq!(user_content[0]["type"], "text");
+        let intro = user_content[0]["text"].as_str().unwrap();
+        assert!(
+            intro.contains("call_a") && intro.contains("call_b") && intro.contains("call_c"),
+            "intro should list every originating tool_call_id, got: {intro}"
+        );
+
+        // Each image is preceded by a "from <call_id>:" label so the
+        // model can correlate without relying on positional ordering.
+        assert_eq!(user_content[1]["type"], "text");
+        assert!(user_content[1]["text"].as_str().unwrap().contains("call_a"));
+        assert_eq!(user_content[2]["type"], "image_url");
+        assert_eq!(
+            user_content[2]["image_url"]["url"],
+            "data:image/png;base64,AAA"
+        );
+        assert!(user_content[3]["text"].as_str().unwrap().contains("call_b"));
+        assert_eq!(
+            user_content[4]["image_url"]["url"],
+            "data:image/png;base64,BBB"
+        );
+        assert!(user_content[5]["text"].as_str().unwrap().contains("call_c"));
+        assert_eq!(
+            user_content[6]["image_url"]["url"],
+            "data:image/png;base64,CCC"
+        );
+    }
+
+    #[test]
+    fn messages_to_openai_user_message_with_image_uses_array_content() {
+        // User attaches an image to a chat message (Phase 4 paste /
+        // drag-drop). OpenAI requires array-form `content` whenever
+        // an image_url block appears, even if the only sibling block
+        // is a text part. Verify the wire shape.
+        use crate::types::{ContentBlock, ImageSource};
+        let req = StreamRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "what's in this?".into(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/jpeg".into(),
+                            data: "ZZZ".into(),
+                        },
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let msgs = OpenAIProvider::messages_to_openai(&req);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let content = msgs[0]["content"].as_array().expect("array content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what's in this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/jpeg;base64,ZZZ");
+    }
+
+    #[test]
+    fn messages_to_openai_text_only_tool_result_skips_synthetic_user() {
+        // No images in the tool_result → no synthetic user message
+        // (regression guard against accidentally appending an empty
+        // user message after every text-only tool call).
+        let req = StreamRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_3".into(),
+                        name: "Bash".into(),
+                        input: json!({"cmd": "ls"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_3".into(),
+                        content: "file1\nfile2\n".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let msgs = OpenAIProvider::messages_to_openai(&req);
+        // assistant(tool_use), tool(text) — no synthetic user.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "tool");
     }
 
     #[test]

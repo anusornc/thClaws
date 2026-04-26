@@ -19,7 +19,7 @@
 
 use super::{EventStream, ModelInfo, Provider, ProviderEvent, StreamRequest, Usage};
 use crate::error::{Error, Result};
-use crate::types::{ContentBlock, Role};
+use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -134,6 +134,20 @@ impl GeminiProvider {
                     // turns against a thinking model — only the wire body
                     // strips it.
                     ContentBlock::Thinking { .. } => {}
+                    // User-attached image (Phase 4 paste/drag-drop).
+                    // Gemini's `inlineData` part can sit alongside text
+                    // parts inside the same user content, so we just
+                    // push it into the parts vec directly.
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 { media_type, data },
+                    } => {
+                        parts.push(json!({
+                            "inlineData": {
+                                "mimeType": media_type,
+                                "data": data,
+                            }
+                        }));
+                    }
                     ContentBlock::ToolUse { name, input, .. } => {
                         parts.push(json!({
                             "functionCall": { "name": name, "args": input }
@@ -148,12 +162,39 @@ impl GeminiProvider {
                             .get(tool_use_id)
                             .cloned()
                             .unwrap_or_else(|| "unknown".to_string());
+                        // The functionResponse part itself is text-only —
+                        // Gemini parses `response.content` as a scalar
+                        // string. Multimodal payloads (Read on a PNG)
+                        // ride alongside as inlineData parts in the
+                        // same user content (see below).
                         parts.push(json!({
                             "functionResponse": {
                                 "name": name,
-                                "response": { "content": content }
+                                "response": { "content": content.to_text() }
                             }
                         }));
+                        // Image-bearing tool result → push inlineData
+                        // parts into the same user content. Gemini
+                        // accepts mixed part types within one content,
+                        // and a vision-capable model (gemini-1.5-*,
+                        // gemini-2.x family) decodes inlineData as an
+                        // image. Non-vision models will reject — the
+                        // user must select an appropriate model.
+                        if let ToolResultContent::Blocks(blocks) = content {
+                            for b in blocks {
+                                if let ToolResultBlock::Image {
+                                    source: ImageSource::Base64 { media_type, data },
+                                } = b
+                                {
+                                    parts.push(json!({
+                                        "inlineData": {
+                                            "mimeType": media_type,
+                                            "data": data,
+                                        }
+                                    }));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -703,6 +744,145 @@ mod tests {
             contents[2]["parts"][0]["functionResponse"]["response"]["content"],
             "file body"
         );
+    }
+
+    #[test]
+    fn messages_to_gemini_image_tool_result_emits_inline_data_part() {
+        // ToolResult with Blocks (Image + Text) — Gemini wants the
+        // functionResponse part to carry only the text summary, with
+        // each image emitted as a sibling inlineData part inside the
+        // *same* user content. Mixing part types within one content
+        // is the documented Gemini pattern for getting tool-returned
+        // imagery in front of a vision-capable model.
+        use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
+        let req = StreamRequest {
+            model: "gemini-2.0-flash".into(),
+            system: None,
+            messages: vec![
+                crate::types::Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t2".into(),
+                        name: "Read".into(),
+                        input: json!({"path": "/tmp/x.png"}),
+                    }],
+                },
+                crate::types::Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "t2".into(),
+                        content: ToolResultContent::Blocks(vec![
+                            ToolResultBlock::Image {
+                                source: ImageSource::Base64 {
+                                    media_type: "image/png".into(),
+                                    data: "AAAA".into(),
+                                },
+                            },
+                            ToolResultBlock::Text {
+                                text: "image: x.png · 1 KB · image/png".into(),
+                            },
+                        ]),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let contents = GeminiProvider::messages_to_gemini(&req);
+        // model(functionCall), user(functionResponse + inlineData)
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[1]["role"], "user");
+        let parts = contents[1]["parts"].as_array().expect("parts array");
+        assert_eq!(
+            parts.len(),
+            2,
+            "expected functionResponse + inlineData parts, got {parts:#?}"
+        );
+
+        // First part: text-only functionResponse summarizing the image.
+        assert_eq!(parts[0]["functionResponse"]["name"], "Read");
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["content"],
+            "image: x.png · 1 KB · image/png"
+        );
+
+        // Second part: inlineData carrying the actual pixels.
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn messages_to_gemini_user_message_with_image_emits_inline_data() {
+        // User attaches an image to a chat message (Phase 4 paste /
+        // drag-drop). Gemini accepts inlineData parts directly inside
+        // a user content's parts array, alongside text parts.
+        use crate::types::{ContentBlock, ImageSource};
+        let req = StreamRequest {
+            model: "gemini-2.0-flash".into(),
+            system: None,
+            messages: vec![crate::types::Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "describe this image".into(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "QQQQ".into(),
+                        },
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let contents = GeminiProvider::messages_to_gemini(&req);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "describe this image");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "QQQQ");
+    }
+
+    #[test]
+    fn messages_to_gemini_text_only_tool_result_skips_inline_data() {
+        // No images → no extra inlineData part. Regression guard
+        // against accidentally appending empty parts every turn.
+        let req = StreamRequest {
+            model: "gemini-2.0-flash".into(),
+            system: None,
+            messages: vec![
+                crate::types::Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t3".into(),
+                        name: "Bash".into(),
+                        input: json!({"cmd": "ls"}),
+                    }],
+                },
+                crate::types::Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "t3".into(),
+                        content: "file1\nfile2\n".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let contents = GeminiProvider::messages_to_gemini(&req);
+        let parts = contents[1]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 1, "expected only the functionResponse part");
+        assert!(parts[0].get("functionResponse").is_some());
     }
 
     #[test]

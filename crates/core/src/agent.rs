@@ -149,6 +149,22 @@ impl Agent {
         &self,
         user_msg: String,
     ) -> impl Stream<Item = Result<AgentEvent>> + Send + 'static {
+        // Common case: a plain text turn. Wrap as a single Text block
+        // and delegate to the multipart entry point so the body lives
+        // in exactly one place.
+        self.run_turn_multipart(vec![ContentBlock::text(user_msg)])
+    }
+
+    /// Multipart variant of [`run_turn`]. Accepts an arbitrary list of
+    /// content blocks for the user turn — used by the GUI chat composer
+    /// to ship a message with both text and pasted/dragged image
+    /// attachments (Phase 4: paste/drag → ContentBlock::Image alongside
+    /// ContentBlock::Text). Exact same agent loop semantics; the only
+    /// difference is what gets pushed onto history at turn start.
+    pub fn run_turn_multipart(
+        &self,
+        user_content: Vec<ContentBlock>,
+    ) -> impl Stream<Item = Result<AgentEvent>> + Send + 'static {
         let provider = self.provider.clone();
         let tools = self.tools.clone();
         let model = self.model.clone();
@@ -165,7 +181,10 @@ impl Agent {
         try_stream! {
             {
                 let mut h = history.lock().expect("history lock");
-                h.push(Message::user(user_msg));
+                h.push(Message {
+                    role: Role::User,
+                    content: user_content,
+                });
             }
 
             let mut current_max_tokens = base_max_tokens;
@@ -314,7 +333,7 @@ impl Agent {
                             let msg = format!("unknown tool: {name}");
                             result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
-                                content: msg.clone(),
+                                content: msg.clone().into(),
                                 is_error: true,
                             });
                             yield AgentEvent::ToolCallResult {
@@ -340,7 +359,7 @@ impl Agent {
                             let denied = format!("denied by user: {name}");
                             result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
-                                content: denied.clone(),
+                                content: denied.clone().into(),
                                 is_error: true,
                             });
                             yield AgentEvent::ToolCallDenied {
@@ -357,20 +376,34 @@ impl Agent {
                         input: input.clone(),
                     };
 
-                    let tool_result = tool.call(input.clone()).await;
+                    let tool_result = tool.call_multimodal(input.clone()).await;
 
                     let (content, is_error) = match &tool_result {
-                        Ok(s) => (maybe_truncate_to_disk(s), false),
-                        Err(e) => (format!("error: {e}"), true),
+                        Ok(c) => {
+                            // Truncate-to-disk only applies to text payloads;
+                            // multimodal blocks (e.g. an image returned by
+                            // Read) are passed through unchanged.
+                            let truncated = match c {
+                                crate::types::ToolResultContent::Text(s) => {
+                                    crate::types::ToolResultContent::Text(maybe_truncate_to_disk(s))
+                                }
+                                crate::types::ToolResultContent::Blocks(_) => c.clone(),
+                            };
+                            (truncated, false)
+                        }
+                        Err(e) => (
+                            crate::types::ToolResultContent::Text(format!("error: {e}")),
+                            true,
+                        ),
                     };
                     // Anthropic (and some other providers) reject
                     //   user messages must have non-empty content
-                    // when a tool result is an empty string (e.g. a
-                    // successful Write, a Bash with no stdout). Replace
-                    // empty results with a minimal marker so the model
-                    // still knows the call completed.
+                    // when a tool result is empty (e.g. a successful
+                    // Write, a Bash with no stdout). Replace empty
+                    // text-only results with a minimal marker so the
+                    // model still knows the call completed.
                     let content = if content.is_empty() {
-                        "(no output)".to_string()
+                        crate::types::ToolResultContent::Text("(no output)".to_string())
                     } else {
                         content
                     };
@@ -384,7 +417,7 @@ impl Agent {
                         id: id.clone(),
                         name: name.clone(),
                         output: match tool_result {
-                            Ok(s) => Ok(s),
+                            Ok(c) => Ok(c.to_text()),
                             Err(e) => Err(format!("{e}")),
                         },
                     };
@@ -629,7 +662,8 @@ mod tests {
         } = &tool_result_msg.content[0]
         {
             assert!(*is_error, "expected is_error=true for failed tool");
-            assert!(content.contains("error:"), "got: {content}");
+            let text = content.to_text();
+            assert!(text.contains("error:"), "got: {text}");
         } else {
             panic!("expected tool_result block");
         }
@@ -708,7 +742,8 @@ mod tests {
             })
         });
         let content = tool_result_msg.expect("denied tool_result not in history");
-        assert!(content.contains("denied"), "got: {content}");
+        let text = content.to_text();
+        assert!(text.contains("denied"), "got: {text}");
     }
 
     #[tokio::test]

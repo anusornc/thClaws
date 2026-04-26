@@ -78,6 +78,13 @@ impl OpenAIResponsesProvider {
                     // For now, drop — when Responses-API thinking models
                     // are wired up, map this to `{"type":"reasoning",...}`.
                     ContentBlock::Thinking { .. } => {}
+                    // Image input on the Responses API is technically
+                    // supported via `input_image` content blocks but
+                    // that path isn't wired here yet — drop on the
+                    // wire (the block stays in local history so a
+                    // future turn against a vision-capable provider
+                    // still sees it).
+                    ContentBlock::Image { .. } => {}
                     ContentBlock::ToolUse { id, name, input } => {
                         out.push(json!({
                             "type": "function_call",

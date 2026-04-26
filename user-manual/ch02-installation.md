@@ -26,7 +26,7 @@ Pick the right macOS build:
 
 > **Prefer to build from source?** thClaws is open source — clone
 > [github.com/thClaws/thClaws](https://github.com/thClaws/thClaws)
-> and run `cargo build --release --features gui` (Rust 1.78+,
+> and run `cargo build --release --features gui` (Rust 1.85+,
 > Node.js 20+, pnpm 9+). The downloads below are the recommended
 > install route for most users.
 

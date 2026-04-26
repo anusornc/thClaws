@@ -1093,7 +1093,41 @@ pub fn run_gui() {
                         String::new()
                     };
                     let trimmed = line.trim_end_matches(['\r', '\n']);
-                    if !trimmed.is_empty() {
+
+                    // Optional image attachments shipped alongside the
+                    // text (Phase 4 paste/drag-drop). Frontend sends
+                    // `attachments: [{mediaType, data}, ...]` where
+                    // data is the base64 of the raw image bytes (no
+                    // data: prefix). Only the chat tab emits this
+                    // field; the terminal tab never has attachments.
+                    let attachments: Vec<(String, String)> = msg
+                        .get("attachments")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|a| {
+                                    let media_type = a
+                                        .get("mediaType")
+                                        .and_then(|v| v.as_str())?
+                                        .to_string();
+                                    let data =
+                                        a.get("data").and_then(|v| v.as_str())?.to_string();
+                                    if data.is_empty() {
+                                        None
+                                    } else {
+                                        Some((media_type, data))
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    if !attachments.is_empty() {
+                        let _ = shared_for_ipc.input_tx.send(ShellInput::LineWithImages {
+                            text: trimmed.to_string(),
+                            images: attachments,
+                        });
+                    } else if !trimmed.is_empty() {
                         let _ = shared_for_ipc
                             .input_tx
                             .send(ShellInput::Line(trimmed.to_string()));
