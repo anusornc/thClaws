@@ -172,23 +172,9 @@ For books, training, and commercial deployment, see [agentic-press.com](https://
 
 Every avatar below has a merged commit in this repo. The roadmap is theirs.
 
-<p>
-  <a href="https://github.com/mozeal"><img src="https://github.com/mozeal.png?size=64" width="48" height="48" alt="mozeal" title="mozeal — maintainer" style="border-radius:50%"/></a>
-  <a href="https://github.com/parintorns"><img src="https://github.com/parintorns.png?size=64" width="48" height="48" alt="parintorns" title="parintorns" style="border-radius:50%"/></a>
-  <a href="https://github.com/sunchiro"><img src="https://github.com/sunchiro.png?size=64" width="48" height="48" alt="sunchiro" title="sunchiro" style="border-radius:50%"/></a>
-  <a href="https://github.com/siharat-th"><img src="https://github.com/siharat-th.png?size=64" width="48" height="48" alt="siharat-th" title="siharat-th — terminal slash popup, caret editing (#20, #22)" style="border-radius:50%"/></a>
-  <a href="https://github.com/gokusenz"><img src="https://github.com/gokusenz.png?size=64" width="48" height="48" alt="gokusenz" title="gokusenz" style="border-radius:50%"/></a>
-  <a href="https://github.com/chawasit"><img src="https://github.com/chawasit.png?size=64" width="48" height="48" alt="chawasit" title="chawasit — Windows hotfix #29, context override #30, anthropic cache #33, build helpers #34" style="border-radius:50%"/></a>
-  <a href="https://github.com/Av0cadoo"><img src="https://github.com/Av0cadoo.png?size=64" width="48" height="48" alt="Av0cadoo" title="Av0cadoo — Ollama Cloud (#28)" style="border-radius:50%"/></a>
-  <a href="https://github.com/Kinzen-dev"><img src="https://github.com/Kinzen-dev.png?size=64" width="48" height="48" alt="Kinzen-dev" title="Kinzen-dev — AskUser GUI bridge, Cmd+Q/W (#16)" style="border-radius:50%"/></a>
-  <a href="https://github.com/bombman"><img src="https://github.com/bombman.png?size=64" width="48" height="48" alt="bombman" title="bombman" style="border-radius:50%"/></a>
-  <a href="https://github.com/SalmonRK"><img src="https://github.com/SalmonRK.png?size=64" width="48" height="48" alt="SalmonRK" title="SalmonRK — OpenAICompat provider (#35)" style="border-radius:50%"/></a>
-  <a href="https://github.com/Parinya-chab"><img src="https://github.com/Parinya-chab.png?size=64" width="48" height="48" alt="Parinya-chab" title="Parinya-chab — Azure AI Foundry (#21)" style="border-radius:50%"/></a>
-</p>
+[![Contributors](https://contrib.rocks/image?repo=thClaws/thClaws)](https://github.com/thClaws/thClaws/graphs/contributors)
 
-Avatars order by contribution count (mozeal first as maintainer; the rest by GitHub's count). Hover any avatar for a one-line note on what they shipped. Filed an issue or merged a PR? You belong here — open a [PR against the README](https://github.com/thClaws/thClaws/blob/main/README.md) and add yourself, or just ping us and we will.
-
-See the full [contributor graph](https://github.com/thClaws/thClaws/graphs/contributors) for the up-to-date count.
+Auto-generated from the [contributors graph](https://github.com/thClaws/thClaws/graphs/contributors) (refreshes within ~24h of a new merge). Filed a PR or shipped a fix? You'll show up here automatically — no README edit required. For the per-PR attribution of who shipped what, see the entries in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
