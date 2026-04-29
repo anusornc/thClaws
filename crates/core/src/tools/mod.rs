@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 pub mod ask;
 pub mod bash;
+pub mod docx_create;
 pub mod edit;
 pub mod glob;
 pub mod grep;
@@ -22,15 +23,18 @@ pub mod ls;
 pub mod pdf_create;
 pub mod pdf_read;
 pub mod plan;
+pub mod pptx_create;
 pub mod read;
 pub mod search;
 pub mod tasks;
 pub mod todo;
 pub mod web;
 pub mod write;
+pub mod xlsx_create;
 
 pub use ask::{set_gui_ask_sender, AskUserRequest, AskUserTool};
 pub use bash::BashTool;
+pub use docx_create::DocxCreateTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -39,11 +43,13 @@ pub use ls::LsTool;
 pub use pdf_create::PdfCreateTool;
 pub use pdf_read::PdfReadTool;
 pub use plan::{EnterPlanModeTool, ExitPlanModeTool};
+pub use pptx_create::PptxCreateTool;
 pub use read::ReadTool;
 pub use search::WebSearchTool;
 pub use todo::TodoWriteTool;
 pub use web::WebFetchTool;
 pub use write::WriteTool;
+pub use xlsx_create::XlsxCreateTool;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -90,6 +96,9 @@ impl ToolRegistry {
         r.register(Arc::new(GlobTool));
         r.register(Arc::new(GrepTool));
         r.register(Arc::new(BashTool));
+        r.register(Arc::new(DocxCreateTool));
+        r.register(Arc::new(XlsxCreateTool));
+        r.register(Arc::new(PptxCreateTool));
         r.register(Arc::new(PdfCreateTool));
         r.register(Arc::new(PdfReadTool));
         r.register(Arc::new(WebFetchTool::new()));
@@ -182,6 +191,7 @@ mod tests {
             vec![
                 "AskUserQuestion",
                 "Bash",
+                "DocxCreate",
                 "Edit",
                 "EnterPlanMode",
                 "ExitPlanMode",
@@ -190,11 +200,13 @@ mod tests {
                 "Ls",
                 "PdfCreate",
                 "PdfRead",
+                "PptxCreate",
                 "Read",
                 "TodoWrite",
                 "WebFetch",
                 "WebSearch",
-                "Write"
+                "Write",
+                "XlsxCreate"
             ]
         );
         for def in &defs {
