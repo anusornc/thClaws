@@ -52,7 +52,12 @@ pub struct PluginManifest {
     pub version: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
+    /// Author. Accepts either a flat string (`"author": "Jane Doe"`)
+    /// or an object (`"author": {"name": "Jane Doe", "email": "..."}`)
+    /// — the latter is the convention used by `anthropics/skills` and
+    /// the Claude Code plugin spec, so forks of upstream plugins
+    /// don't need to mangle their manifest just to install in thClaws.
+    #[serde(default, deserialize_with = "deserialize_author_flexible")]
     pub author: String,
     /// Subdirs (relative to the plugin root) whose children are individual
     /// skill dirs (each containing a SKILL.md).
@@ -93,6 +98,31 @@ pub struct McpServerEntry {
 
 fn default_transport() -> String {
     "stdio".into()
+}
+
+/// Accept `author` in either of two common shapes and normalize to a
+/// display string:
+///   - `"author": "Jane Doe"`                              → `"Jane Doe"`
+///   - `"author": {"name": "Jane Doe", "email": "j@x.io"}` → `"Jane Doe"`
+///   - `"author": null` or missing                          → `""`
+/// Letting both shapes deserialize means anthropics-style plugin
+/// manifests work in thClaws unchanged.
+fn deserialize_author_flexible<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Object(map) => map
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(String::from)
+            .unwrap_or_default(),
+        serde_json::Value::Null => String::new(),
+        _ => String::new(),
+    })
 }
 
 impl McpServerEntry {
@@ -531,16 +561,64 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
 }
 
 fn git_clone(url: &str, dest: &Path) -> Result<()> {
+    // Support the marketplace-style `<url>#<branch>:<subpath>`
+    // extension so a plugin can be installed out of a multi-plugin
+    // monorepo (mirrors what skills::install_from_url already does).
+    // Plain URLs (no fragment) round-trip through unchanged.
+    let (base_url, branch, subpath) = crate::skills::parse_git_subpath(url);
+
+    // When a subpath is requested we clone into a sibling staging dir
+    // (next to the destination, same volume so the rename is cheap),
+    // then move only the subpath into `dest` and discard the rest.
+    let stage_dir: PathBuf = if subpath.is_some() {
+        let parent = dest
+            .parent()
+            .ok_or_else(|| Error::Config("plugin clone dest has no parent".to_string()))?;
+        parent.join(format!(".clone-{}", uuid::Uuid::new_v4().simple()))
+    } else {
+        dest.to_path_buf()
+    };
+
+    let mut args: Vec<String> = vec!["clone".into(), "--depth".into(), "1".into()];
+    if let Some(b) = &branch {
+        args.push("--branch".into());
+        args.push(b.clone());
+    }
+    args.push(base_url.clone());
+    args.push(stage_dir.to_string_lossy().into_owned());
+
     let out = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", url, &dest.to_string_lossy()])
+        .args(&args)
         .output()
         .map_err(|e| Error::Config(format!("spawn git: {e}")))?;
     if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&stage_dir);
         return Err(Error::Config(format!(
             "git clone failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+
+    if let Some(sub) = &subpath {
+        let src = stage_dir.join(sub);
+        if !src.is_dir() {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(Error::Config(format!(
+                "subpath '{sub}' not found in cloned repo (or is not a directory)"
+            )));
+        }
+        // `dest` was created by the caller (`fs::create_dir_all` in
+        // `install`); rename refuses to clobber a non-empty target,
+        // so remove the placeholder first then move the subpath into
+        // place under that exact path.
+        let _ = std::fs::remove_dir_all(dest);
+        std::fs::rename(&src, dest).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            Error::Config(format!("move subpath into place: {e}"))
+        })?;
+        let _ = std::fs::remove_dir_all(&stage_dir);
+    }
+
     Ok(())
 }
 

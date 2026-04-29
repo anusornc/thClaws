@@ -325,7 +325,7 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
         ViewEvent::ToolCallStart { name: _, label } => {
             Some(format!("\r\n\x1b[2m[tool: {label}]\x1b[0m"))
         }
-        ViewEvent::ToolCallResult { .. } => Some(" \x1b[32m✓\x1b[0m".to_string()),
+        ViewEvent::ToolCallResult { .. } => Some(" \x1b[32m✓\x1b[0m\r\n".to_string()),
         ViewEvent::SlashOutput(text) => {
             let body = text.replace('\n', "\r\n");
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
