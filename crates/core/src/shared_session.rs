@@ -995,6 +995,45 @@ async fn handle_line(
     );
 
     if trimmed.starts_with('/') {
+        // `/<skill-name> [args]` shortcut — same UX as the CLI repl
+        // (see repl.rs:2406). If `parse_slash` returns Unknown AND the
+        // first word matches an installed skill name, rewrite to a
+        // normal user prompt and fall through to the regular agent
+        // pipeline; the model then calls `Skill(name: …)` to load the
+        // skill content. Without this, every plugin-contributed skill
+        // surfaced as "unknown command" in the GUI even when the
+        // skill was loaded into the registry.
+        if let Some(crate::repl::SlashCommand::Unknown(what)) = crate::repl::parse_slash(trimmed) {
+            let word = what.split_whitespace().next().unwrap_or("").to_string();
+            let skill_present = state
+                .skill_store
+                .lock()
+                .ok()
+                .map(|s| s.skills.contains_key(&word))
+                .unwrap_or(false);
+            if skill_present {
+                let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
+                let args = body.strip_prefix(&word).unwrap_or("").trim();
+                let args_note = if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" The user's task for this skill: {args}")
+                };
+                let rewritten = format!(
+                    "The user ran the `/{word}` slash command. Call `Skill(name: \"{word}\")` right away and follow the instructions it returns.{args_note}"
+                );
+                // Fall through to the regular agent pipeline below
+                // with the rewritten prompt instead of dispatching as
+                // a slash command.
+                emit_skill_resolution_hint(events_tx, &word);
+                let stream = Box::pin(state.agent.run_turn(rewritten));
+                let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+                let _ = lead_mb.write_status("lead", "working", None);
+                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb).await;
+                return;
+            }
+        }
+
         crate::shell_dispatch::dispatch(trimmed, state, events_tx).await;
         let _ = events_tx.send(ViewEvent::TurnDone);
         return;
@@ -1153,6 +1192,14 @@ async fn drive_turn_stream(
             _ => {}
         }
     }
+}
+
+/// Surface the `/skill → Skill(name: …)` resolution to the user the
+/// same way the CLI does, so it's clear which skill is about to fire.
+fn emit_skill_resolution_hint(events_tx: &broadcast::Sender<ViewEvent>, name: &str) {
+    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+        "(/{name} → Skill(name: \"{name}\"))"
+    )));
 }
 
 fn write_lead_log(log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>, s: &str) {
