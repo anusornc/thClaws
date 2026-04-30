@@ -871,6 +871,8 @@ pub async fn install_mcp_from_marketplace(
     // Build the mcp.json config from the entry. Transport shape:
     //   - "sse"   → http transport, url-only
     //   - "stdio" → command + args, no url
+    // Marketplace install — trusted, so the server can render UI
+    // widgets and accept widget-initiated tool calls.
     let cfg = if entry.transport == "sse" {
         crate::mcp::McpServerConfig {
             name: entry.name.clone(),
@@ -880,6 +882,7 @@ pub async fn install_mcp_from_marketplace(
             env: Default::default(),
             url: entry.url.clone(),
             headers: Default::default(),
+            trusted: true,
         }
     } else {
         crate::mcp::McpServerConfig {
@@ -890,6 +893,7 @@ pub async fn install_mcp_from_marketplace(
             env: Default::default(),
             url: String::new(),
             headers: Default::default(),
+            trusted: true,
         }
     };
     let saved_to =
@@ -3265,6 +3269,10 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 SlashCommand::McpAdd { name, url, user } => {
                     let scope = if user { "user" } else { "project" };
+                    // /mcp add is hand-add — untrusted by default. To
+                    // enable widget rendering on a self-added server,
+                    // edit the resulting mcp.json and set
+                    // `"trusted": true` explicitly.
                     let cfg = crate::mcp::McpServerConfig {
                         name: name.clone(),
                         transport: "http".into(),
@@ -3273,6 +3281,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         env: Default::default(),
                         url: url.clone(),
                         headers: Default::default(),
+                        trusted: false,
                     };
                     // 1. Persist to disk.
                     let saved_to = match crate::config::save_mcp_server(&cfg, user) {

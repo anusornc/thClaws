@@ -1355,6 +1355,9 @@ pub async fn dispatch(
             }
         }
         SlashCommand::McpAdd { name, url, user } => {
+            // Hand-add is untrusted by default; enabling widget UI
+            // requires the user to edit mcp.json and set
+            // `"trusted": true` explicitly.
             let cfg = crate::mcp::McpServerConfig {
                 name: name.clone(),
                 transport: "http".into(),
@@ -1363,6 +1366,7 @@ pub async fn dispatch(
                 env: Default::default(),
                 url,
                 headers: Default::default(),
+                trusted: false,
             };
             // 1. Persist to disk (so restarts keep the server).
             let saved_to = match crate::config::save_mcp_server(&cfg, user) {
