@@ -1219,6 +1219,25 @@ pub fn build_provider(config: &AppConfig) -> Result<Arc<dyn Provider>> {
             };
             Ok(Arc::new(OpenAIProvider::new(api_key).with_base_url(url)))
         }
+        ProviderKind::ThaiLLM => {
+            // NSTDA / สวทช Thai LLM aggregator (thaillm.or.th). OpenAI-
+            // compatible endpoint hosting OpenThaiGPT, Typhoon-S,
+            // Pathumma, and THaLLE. Models use the `thaillm/<id>` form;
+            // the prefix is stripped before the request reaches the
+            // upstream. Override via THAILLM_BASE_URL for testing.
+            let base = std::env::var("THAILLM_BASE_URL")
+                .unwrap_or_else(|_| "http://thaillm.or.th/api/v1".to_string());
+            let url = if base.ends_with("/chat/completions") {
+                base
+            } else {
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            };
+            Ok(Arc::new(
+                OpenAIProvider::new(api_key)
+                    .with_base_url(url)
+                    .with_strip_model_prefix("thaillm/"),
+            ))
+        }
         ProviderKind::Ollama
         | ProviderKind::OllamaAnthropic
         | ProviderKind::LMStudio
@@ -1281,6 +1300,7 @@ pub async fn build_provider_with_fallback(
         ProviderKind::Gemini,
         ProviderKind::DashScope,
         ProviderKind::ZAi,
+        ProviderKind::ThaiLLM,
         ProviderKind::Ollama,
         ProviderKind::OllamaAnthropic,
         ProviderKind::OllamaCloud,

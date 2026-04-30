@@ -1010,6 +1010,7 @@ fn auto_fallback_model(cfg: &AppConfig) -> Option<String> {
         ProviderKind::DashScope,
         ProviderKind::ZAi,
         ProviderKind::DeepSeek,
+        ProviderKind::ThaiLLM,
         // Local providers omitted here: if the user explicitly
         // configured one of them, they're already "ready" above; we
         // don't want to auto-fall-back to Ollama for a user who has
