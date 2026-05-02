@@ -213,6 +213,9 @@ pub enum SlashCommand {
     PluginShow {
         name: String,
     },
+    /// `/plugin gc` — remove registry entries whose plugin directory
+    /// is missing or whose manifest fails to parse. M6.16.1 BUG L2.
+    PluginGc,
     Tasks,
     Context,
     Version,
@@ -382,6 +385,10 @@ fn parse_plugin_subcommand(cmd: &str, args: &str) -> SlashCommand {
             Some(name) => SlashCommand::PluginShow { name: name.to_string() },
             None => SlashCommand::Unknown("usage: /plugin show <name>".into()),
         },
+        // `/plugin gc` removes registry entries whose plugin
+        // directory is missing or whose manifest can't be parsed.
+        // No args. M6.16.1 BUG L2.
+        "gc" => SlashCommand::PluginGc,
         "marketplace" => {
             let refresh = rest.split_whitespace().any(|p| p == "--refresh");
             SlashCommand::PluginMarketplace { refresh }
@@ -402,7 +409,7 @@ fn parse_plugin_subcommand(cmd: &str, args: &str) -> SlashCommand {
             None => SlashCommand::Unknown("usage: /plugin info <name>".into()),
         },
         other => SlashCommand::Unknown(format!(
-            "unknown plugin subcommand: '{other}' (try: /plugin, /plugin install, /plugin remove, /plugin enable, /plugin disable, /plugin show, /plugin marketplace, /plugin search, /plugin info)"
+            "unknown plugin subcommand: '{other}' (try: /plugin, /plugin install, /plugin remove, /plugin enable, /plugin disable, /plugin show, /plugin gc, /plugin marketplace, /plugin search, /plugin info)"
         )),
     }
 }
@@ -911,6 +918,23 @@ fn resolve_skill_install_target(
             )),
         ),
     }
+}
+
+/// Sorted list of MCP server names a plugin contributes (or `None`
+/// if the plugin isn't found / has no MCP servers / manifest unread).
+/// Used by /plugin enable / disable / remove to render an emphasized
+/// hint listing the actual server names so the user knows what's
+/// coming after `/quit` + relaunch. M6.16.1 — replaces the older
+/// `plugin_has_mcp_servers` boolean.
+pub fn plugin_mcp_server_names(name: &str) -> Option<Vec<String>> {
+    let plugin = crate::plugins::find_installed(name)?;
+    let manifest = plugin.manifest().ok()?;
+    if manifest.mcp_servers.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = manifest.mcp_servers.keys().cloned().collect();
+    names.sort();
+    Some(names)
 }
 
 /// `/plugin install <X>` mirror of `resolve_skill_install_target`. If
@@ -3315,19 +3339,37 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                     *store = refreshed;
                                 }
                             }
-                            // MCP servers / commands still need a restart
-                            // (the live tool registry doesn't track per-
-                            // plugin contributions). Be honest about it
-                            // when the manifest declares those.
+                            // Skills + commands are live (skill store
+                            // refreshed above; commands re-discover per
+                            // /-resolution call). MCP servers are the
+                            // one piece that still needs a restart —
+                            // the live tool registry doesn't track per-
+                            // plugin server lifecycle. Surface a
+                            // prominent, actionable message listing the
+                            // server names so the user knows exactly
+                            // what they're getting after `/quit` →
+                            // relaunch. M6.16.1 follow-up — pre-fix
+                            // mentioned "commands" too which was no
+                            // longer accurate.
                             if let Some(m) = manifest.as_ref() {
-                                if !m.commands.is_empty() || !m.mcp_servers.is_empty() {
+                                if !m.mcp_servers.is_empty() {
+                                    let names: Vec<&str> = m
+                                        .mcp_servers
+                                        .keys()
+                                        .map(String::as_str)
+                                        .collect();
                                     println!(
-                                        "{COLOR_YELLOW}restart {} to activate the plugin's commands / MCP servers (skills already callable in this session){COLOR_RESET}",
-                                        crate::branding::current().name
+                                        "{COLOR_YELLOW}⚠  restart {} to spawn {} new MCP server(s): {}{COLOR_RESET}",
+                                        crate::branding::current().name,
+                                        names.len(),
+                                        names.join(", ")
+                                    );
+                                    println!(
+                                        "{COLOR_DIM}   skills + commands already callable in this session.{COLOR_RESET}"
                                     );
                                 } else {
                                     println!(
-                                        "{COLOR_DIM}skills callable in this session — no restart needed{COLOR_RESET}"
+                                        "{COLOR_DIM}skills + commands callable in this session — no restart needed{COLOR_RESET}"
                                     );
                                 }
                             }
@@ -3339,9 +3381,30 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 SlashCommand::PluginEnable { name, user } => {
                     match crate::plugins::set_enabled(&name, user, true) {
-                        Ok(true) => println!(
-                            "{COLOR_DIM}plugin '{name}' enabled (restart to pick up its contributions){COLOR_RESET}"
-                        ),
+                        Ok(true) => {
+                            // M6.16 BUG H1: refresh in-process skill store
+                            // so plugin-contributed skills become callable
+                            // immediately. MCP servers still need a
+                            // restart — surfaced explicitly with names.
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
+                            println!(
+                                "{COLOR_DIM}plugin '{name}' enabled{COLOR_RESET}"
+                            );
+                            if let Some(names) = plugin_mcp_server_names(&name) {
+                                println!(
+                                    "{COLOR_YELLOW}⚠  restart {} to spawn {} MCP server(s): {}{COLOR_RESET}",
+                                    crate::branding::current().name,
+                                    names.len(),
+                                    names.join(", ")
+                                );
+                            }
+                        }
                         Ok(false) => println!(
                             "{COLOR_YELLOW}no plugin named '{name}' in that scope{COLOR_RESET}"
                         ),
@@ -3349,10 +3412,31 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::PluginDisable { name, user } => {
+                    // Capture MCP names BEFORE disabling — symmetric
+                    // with PluginRemove, where the manifest is gone
+                    // after the call.
+                    let mcp_to_drop = plugin_mcp_server_names(&name);
                     match crate::plugins::set_enabled(&name, user, false) {
-                        Ok(true) => println!(
-                            "{COLOR_DIM}plugin '{name}' disabled (restart to drop its contributions){COLOR_RESET}"
-                        ),
+                        Ok(true) => {
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
+                            println!(
+                                "{COLOR_DIM}plugin '{name}' disabled{COLOR_RESET}"
+                            );
+                            if let Some(names) = mcp_to_drop {
+                                println!(
+                                    "{COLOR_YELLOW}⚠  restart {} to drop {} MCP server(s) it contributed: {}{COLOR_RESET}",
+                                    crate::branding::current().name,
+                                    names.len(),
+                                    names.join(", ")
+                                );
+                            }
+                        }
                         Ok(false) => println!(
                             "{COLOR_YELLOW}no plugin named '{name}' in that scope{COLOR_RESET}"
                         ),
@@ -3360,14 +3444,19 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::PluginShow { name } => {
-                    match crate::plugins::find_installed(&name) {
-                        Some(p) => {
+                    match crate::plugins::find_installed_with_scope(&name) {
+                        Some((p, is_user)) => {
                             let status = if p.enabled { "enabled" } else { "disabled" };
+                            // M6.16.1 BUG L3: include scope so the
+                            // user knows which `--user` flag to pass
+                            // to follow-up /plugin commands.
+                            let scope = if is_user { "user" } else { "project" };
                             println!(
-                                "{COLOR_DIM}  {} v{} ({}){COLOR_RESET}",
+                                "{COLOR_DIM}  {} v{} ({}, {}){COLOR_RESET}",
                                 p.name,
                                 if p.version.is_empty() { "-" } else { &p.version },
-                                status
+                                status,
+                                scope
                             );
                             println!(
                                 "{COLOR_DIM}  path: {}{COLOR_RESET}",
@@ -3432,12 +3521,66 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         ),
                     }
                 }
+                SlashCommand::PluginGc => match crate::plugins::gc() {
+                    Ok((proj, user)) => {
+                        if proj.is_empty() && user.is_empty() {
+                            println!(
+                                "{COLOR_DIM}no zombie entries — registry is clean{COLOR_RESET}"
+                            );
+                        } else {
+                            println!(
+                                "{COLOR_DIM}removed zombie entries:{COLOR_RESET}"
+                            );
+                            for n in &proj {
+                                println!("{COLOR_DIM}  - {n} (project){COLOR_RESET}");
+                            }
+                            for n in &user {
+                                println!("{COLOR_DIM}  - {n} (user){COLOR_RESET}");
+                            }
+                            // Refresh in case any zombie was contributing
+                            // skills cached in this session.
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => println!("{COLOR_YELLOW}gc failed: {e}{COLOR_RESET}"),
+                },
                 SlashCommand::PluginRemove { name, user } => {
+                    // Capture MCP names BEFORE removal — once remove()
+                    // succeeds the manifest is gone and find_installed
+                    // returns None.
+                    let mcp_to_drop = plugin_mcp_server_names(&name);
                     match crate::plugins::remove(&name, user) {
                         Ok(true) => {
+                            // M6.16 BUG H1: refresh skill store so the
+                            // removed plugin's skills stop being callable
+                            // immediately. Without this the model could
+                            // still invoke a removed skill and lazy-read
+                            // the now-missing SKILL.md → empty body
+                            // cached forever.
+                            let refreshed = crate::skills::SkillStore::discover();
+                            skill_names = refreshed.skills.keys().cloned().collect();
+                            if let Some(handle) = &skill_store_handle {
+                                if let Ok(mut store) = handle.lock() {
+                                    *store = refreshed;
+                                }
+                            }
                             println!(
-                                "{COLOR_DIM}plugin '{name}' removed (restart to drop its contributions){COLOR_RESET}"
+                                "{COLOR_DIM}plugin '{name}' removed{COLOR_RESET}"
                             );
+                            if let Some(names) = mcp_to_drop {
+                                println!(
+                                    "{COLOR_YELLOW}⚠  restart {} to fully drop {} MCP server(s) it was running: {}{COLOR_RESET}",
+                                    crate::branding::current().name,
+                                    names.len(),
+                                    names.join(", ")
+                                );
+                            }
                         }
                         Ok(false) => {
                             println!(
@@ -5089,6 +5232,8 @@ mod tests {
                 name: "code-review".into()
             })
         );
+        // M6.16.1 BUG L2: /plugin gc parses with no args.
+        assert_eq!(parse_slash("/plugin gc"), Some(SlashCommand::PluginGc));
     }
 
     #[test]

@@ -1832,7 +1832,13 @@ pub fn run_gui() {
                             "source": "builtin",
                         }));
                     }
-                    let user_cmds = crate::commands::CommandStore::discover();
+                    // Include plugin-contributed prompt commands so the
+                    // popup matches what `/<name>` resolution will accept
+                    // (CommandStore::discover_with_extra is what the worker
+                    // path uses too — see shared_session.rs slash handler).
+                    let user_cmds = crate::commands::CommandStore::discover_with_extra(
+                        &crate::plugins::plugin_command_dirs(),
+                    );
                     let mut user_names: Vec<&str> = user_cmds.commands.keys()
                         .map(String::as_str)
                         .collect();

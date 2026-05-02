@@ -74,6 +74,14 @@ pub fn estimate_messages_tokens(messages: &[Message]) -> usize {
 /// Fast synchronous compaction: drop oldest messages until under budget.
 /// Preserves tool_use/tool_result pairs — never splits a tool call from its
 /// result, as that would confuse the provider.
+///
+/// M6.17 BUG M1: when only one message remains and it still exceeds the
+/// budget (rare — typically a huge tool_result or a pasted-in user
+/// message larger than the model's context window), the over-budget
+/// content is truncated in-place via [`truncate_oversized_message`]
+/// rather than sent through to the provider, which would respond with
+/// a 400 "context length exceeded" error. The model sees the truncation
+/// notice in the message body and can ask the user / re-fetch.
 pub fn compact(messages: &[Message], budget_tokens: usize) -> Vec<Message> {
     if messages.is_empty() {
         return Vec::new();
@@ -95,7 +103,61 @@ pub fn compact(messages: &[Message], budget_tokens: usize) -> Vec<Message> {
             }
         }
     }
-    messages[start..].to_vec()
+    let mut result = messages[start..].to_vec();
+    // M6.17 BUG M1: only-one-message-and-still-too-big rescue.
+    if result.len() == 1
+        && estimate_message_tokens(&result[0]) > budget_tokens
+    {
+        truncate_oversized_message(&mut result[0], budget_tokens);
+    }
+    result
+}
+
+/// In-place truncation of every Text / ToolResult block in `msg` so the
+/// total estimated tokens fits under `budget_tokens`. Conservative: each
+/// block is truncated independently to roughly `budget * 3` chars (~1
+/// token = 3-4 chars, generous head-room since estimate_tokens already
+/// rounds up). Truncation is char-boundary-safe and appends a notice
+/// the model can read. M6.17 BUG M1 helper.
+fn truncate_oversized_message(msg: &mut Message, budget_tokens: usize) {
+    let target_chars = budget_tokens.saturating_mul(3).max(1024);
+    let notice = format!(
+        "\n\n[...truncated by thClaws: original content exceeded the {} token context budget]",
+        budget_tokens
+    );
+    for block in &mut msg.content {
+        match block {
+            ContentBlock::Text { text } => {
+                if text.len() > target_chars {
+                    *text = format!("{}{notice}", char_safe_head(text, target_chars));
+                }
+            }
+            ContentBlock::ToolResult { content, .. } => {
+                let s = content.to_text();
+                if s.len() > target_chars {
+                    let truncated = format!("{}{notice}", char_safe_head(&s, target_chars));
+                    *content = crate::types::ToolResultContent::Text(truncated);
+                }
+            }
+            // Thinking blocks pass through (provider drops them on echo
+            // anyway). Image / ToolUse blocks are bounded in size.
+            _ => {}
+        }
+    }
+}
+
+/// Slice the longest prefix of `s` that's ≤ `max_bytes` AND lands on a
+/// UTF-8 char boundary. `&s[..n]` panics on a non-boundary byte index;
+/// this picks the largest safe `n`.
+fn char_safe_head(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Summarize older messages into a compact text block, then keep only
@@ -474,7 +536,14 @@ mod tests {
     }
 
     #[test]
-    fn never_drops_below_last_message() {
+    fn never_drops_below_last_message_and_truncates_oversize() {
+        // M6.17 BUG M1: when only one message remains and it still
+        // exceeds the budget, compact truncates the over-budget
+        // content rather than silently sending a request larger than
+        // the model's context window. Pre-fix this test asserted the
+        // returned message was identical to the input — which was the
+        // bug, because that single message would make the provider
+        // 400 with "context length exceeded".
         let huge = "x".repeat(10_000);
         let msgs = vec![
             text_msg(Role::User, &huge),
@@ -482,8 +551,23 @@ mod tests {
             text_msg(Role::User, &huge),
         ];
         let out = compact(&msgs, 1);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0], msgs[2]);
+        assert_eq!(out.len(), 1, "always preserves at least the last message");
+        // After truncation: significantly smaller than the original
+        // 10K, with the truncation notice appended.
+        let text = match &out[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected Text block, got {other:?}"),
+        };
+        assert!(
+            text.len() < huge.len(),
+            "expected truncation; got len={}",
+            text.len()
+        );
+        assert!(
+            text.contains("truncated by thClaws"),
+            "expected truncation notice; got: {}",
+            &text[text.len().saturating_sub(200)..]
+        );
     }
 
     #[test]

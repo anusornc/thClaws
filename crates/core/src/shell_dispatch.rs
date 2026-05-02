@@ -1594,17 +1594,30 @@ pub async fn dispatch(
                         emit(events_tx, format!("rebuild failed: {e}"));
                         return;
                     }
+                    // Skills + commands are live in this session
+                    // (skill store refreshed; commands re-discover per
+                    // /-resolution). MCP servers still need a restart
+                    // — explain prominently with the server names so
+                    // the user knows exactly what's coming after
+                    // relaunch. M6.16.1 follow-up.
                     let mut note = format!(
-                        "plugin '{}' installed ({}) → {}\nSkills refreshed and callable this session.",
+                        "plugin '{}' installed ({}) → {}\nSkills + commands callable this session.",
                         plugin.name,
                         if user { "user" } else { "project" },
                         plugin.path.display(),
                     );
                     if let Ok(m) = plugin.manifest() {
                         if !m.mcp_servers.is_empty() {
+                            let mut names: Vec<&str> = m
+                                .mcp_servers
+                                .keys()
+                                .map(String::as_str)
+                                .collect();
+                            names.sort();
                             note.push_str(&format!(
-                                "\n{} plugin-contributed MCP server(s) still need a restart to spawn — or use /mcp add to register them now.",
-                                m.mcp_servers.len()
+                                "\n\n⚠  restart thClaws (/quit then relaunch) to spawn {} new MCP server(s): {}",
+                                names.len(),
+                                names.join(", ")
                             ));
                         }
                     }
@@ -1613,44 +1626,91 @@ pub async fn dispatch(
                 Err(e) => emit(events_tx, format!("plugin install failed: {e}")),
             }
         }
-        SlashCommand::PluginRemove { name, user } => match crate::plugins::remove(&name, user) {
-            Ok(true) => emit(
-                events_tx,
-                format!("plugin '{name}' removed (restart to drop its contributions)"),
-            ),
-            Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
-            Err(e) => emit(events_tx, format!("remove failed: {e}")),
-        },
+        SlashCommand::PluginRemove { name, user } => {
+            // Capture MCP names BEFORE remove() — once the manifest
+            // file is gone, find_installed returns None.
+            let mcp_to_drop = mcp_server_names(&name);
+            match crate::plugins::remove(&name, user) {
+                Ok(true) => {
+                    // M6.16 BUG H1: refresh skill store + rebuild agent
+                    // so the removed plugin's skill contributions stop
+                    // being callable in this session. Without this, the
+                    // model could still invoke a removed skill and get
+                    // an empty body (the lazy read fails after the file
+                    // is gone, OnceLock caches the empty result). MCP
+                    // subprocess teardown is still restart-bound — see
+                    // the trailing note in the message.
+                    refresh_after_plugin_change(state, events_tx);
+                    let mut note = format!("plugin '{name}' removed");
+                    if let Some(names) = mcp_to_drop {
+                        note.push_str(&format!(
+                            "\n\n⚠  restart thClaws (/quit then relaunch) to fully drop {} MCP server(s) it was running: {}",
+                            names.len(),
+                            names.join(", ")
+                        ));
+                    }
+                    emit(events_tx, note);
+                }
+                Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
+                Err(e) => emit(events_tx, format!("remove failed: {e}")),
+            }
+        }
         SlashCommand::PluginEnable { name, user } => {
             match crate::plugins::set_enabled(&name, user, true) {
-                Ok(true) => emit(
-                    events_tx,
-                    format!("plugin '{name}' enabled (restart to pick up its contributions)"),
-                ),
+                Ok(true) => {
+                    refresh_after_plugin_change(state, events_tx);
+                    let mut note = format!("plugin '{name}' enabled");
+                    if let Some(names) = mcp_server_names(&name) {
+                        note.push_str(&format!(
+                            "\n\n⚠  restart thClaws (/quit then relaunch) to spawn {} MCP server(s): {}",
+                            names.len(),
+                            names.join(", ")
+                        ));
+                    }
+                    emit(events_tx, note);
+                }
                 Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
                 Err(e) => emit(events_tx, format!("enable failed: {e}")),
             }
         }
         SlashCommand::PluginDisable { name, user } => {
+            // Capture MCP names BEFORE disabling so the message can
+            // list them; set_enabled doesn't delete the manifest, but
+            // keeping the lookup symmetric with PluginRemove makes
+            // the helper reusable.
+            let mcp_to_drop = mcp_server_names(&name);
             match crate::plugins::set_enabled(&name, user, false) {
-                Ok(true) => emit(
-                    events_tx,
-                    format!("plugin '{name}' disabled (restart to drop its contributions)"),
-                ),
+                Ok(true) => {
+                    refresh_after_plugin_change(state, events_tx);
+                    let mut note = format!("plugin '{name}' disabled");
+                    if let Some(names) = mcp_to_drop {
+                        note.push_str(&format!(
+                            "\n\n⚠  restart thClaws (/quit then relaunch) to drop {} MCP server(s) it contributed: {}",
+                            names.len(),
+                            names.join(", ")
+                        ));
+                    }
+                    emit(events_tx, note);
+                }
                 Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
                 Err(e) => emit(events_tx, format!("disable failed: {e}")),
             }
         }
-        SlashCommand::PluginShow { name } => match crate::plugins::find_installed(&name) {
-            Some(p) => {
+        SlashCommand::PluginShow { name } => match crate::plugins::find_installed_with_scope(&name) {
+            Some((p, is_user)) => {
                 let status = if p.enabled { "enabled" } else { "disabled" };
+                let scope = if is_user { "user" } else { "project" };
                 let version = if p.version.is_empty() {
                     "-"
                 } else {
                     &p.version
                 };
+                // M6.16.1 BUG L3: include scope in the output so the
+                // user knows which `--user` flag to pass to subsequent
+                // /plugin disable / enable / remove. Pre-fix the user
+                // had to inspect the path string to figure it out.
                 let mut out = format!(
-                    "{} v{version} ({status})\npath: {}\n",
+                    "{} v{version} ({status}, {scope})\npath: {}\n",
                     p.name,
                     p.path.display()
                 );
@@ -1660,6 +1720,26 @@ pub async fn dispatch(
                 emit(events_tx, out);
             }
             None => emit(events_tx, format!("no plugin named '{name}'")),
+        },
+        SlashCommand::PluginGc => match crate::plugins::gc() {
+            Ok((proj, user)) => {
+                if proj.is_empty() && user.is_empty() {
+                    emit(events_tx, "no zombie entries — registry is clean".into());
+                } else {
+                    let mut out = String::from("removed zombie entries:\n");
+                    for n in &proj {
+                        out.push_str(&format!("  - {n} (project)\n"));
+                    }
+                    for n in &user {
+                        out.push_str(&format!("  - {n} (user)\n"));
+                    }
+                    // Refresh in case any zombie was contributing
+                    // skills cached in the worker.
+                    refresh_after_plugin_change(state, events_tx);
+                    emit(events_tx, out);
+                }
+            }
+            Err(e) => emit(events_tx, format!("gc failed: {e}")),
         },
 
         // ─── team ───────────────────────────────────────────────────
@@ -2041,3 +2121,44 @@ fn broadcast_mcp_update(events_tx: &broadcast::Sender<ViewEvent>) {
     let payload = crate::gui::build_mcp_update_payload();
     let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
 }
+
+/// M6.16 BUG H1 helper: refresh skill_store + rebuild system prompt
+/// + rebuild agent so plugin contributions stop / start being callable
+/// in this session without a restart. Mirrors the install path's
+/// refresh block; called from PluginRemove / PluginEnable / PluginDisable.
+/// MCP subprocess teardown is NOT handled here — the live tool registry
+/// can't surgically detach an already-spawned client. Callers append a
+/// hint to their user-facing message when the plugin contributed MCP
+/// servers (see has_running_mcp_contributions).
+fn refresh_after_plugin_change(
+    state: &mut crate::shared_session::WorkerState,
+    events_tx: &broadcast::Sender<crate::shared_session::ViewEvent>,
+) {
+    let refreshed = crate::skills::SkillStore::discover();
+    if let Ok(mut store) = state.skill_store.lock() {
+        *store = refreshed;
+    }
+    state.rebuild_system_prompt();
+    if let Err(e) = state.rebuild_agent(true) {
+        emit(events_tx, format!("[plugin] agent rebuild failed: {e}"));
+    }
+}
+
+/// Sorted list of MCP server names a plugin contributes (or `None`
+/// if the plugin isn't found / has no MCP servers / manifest unread).
+/// Used by /plugin install / enable / disable / remove to render an
+/// emphasized "⚠  restart to spawn / drop server(s): a, b, c" hint
+/// — the user gets the actual names so they know what's coming
+/// after relaunch, not just a generic "restart needed" note.
+/// M6.16.1 — replaces the older boolean `has_running_mcp_contributions`.
+fn mcp_server_names(name: &str) -> Option<Vec<String>> {
+    let plugin = crate::plugins::find_installed(name)?;
+    let manifest = plugin.manifest().ok()?;
+    if manifest.mcp_servers.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = manifest.mcp_servers.keys().cloned().collect();
+    names.sort();
+    Some(names)
+}
+

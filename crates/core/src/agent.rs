@@ -667,6 +667,15 @@ pub struct Agent {
     pub permission_mode: PermissionMode,
     approver: Arc<dyn ApprovalSink>,
     history: Arc<Mutex<Vec<Message>>>,
+    /// Cooperative cancel signal shared with the worker / driver. M6.17
+    /// BUGs H1 + M3: pre-fix the agent's retry-backoff sleeps blocked
+    /// uninterruptibly (1+2+4 = 7 s worst case), so a Cancel during a
+    /// transient-error retry was silently waited out. With a cancel
+    /// token wired in, the sleep `tokio::select!`s against
+    /// `cancelled().await` and exits with a synthetic error mid-wait.
+    /// `None` for tests / non-interactive consumers that don't want
+    /// cancellation plumbing.
+    cancel: Option<crate::cancel::CancelToken>,
 }
 
 impl Agent {
@@ -696,7 +705,16 @@ impl Agent {
             permission_mode: PermissionMode::Auto,
             approver: Arc::new(AutoApprover),
             history: Arc::new(Mutex::new(Vec::new())),
+            cancel: None,
         }
+    }
+
+    /// Wire in a cancel token so retry sleeps and (future) long awaits
+    /// can be interrupted by the worker / driver. Caller is responsible
+    /// for `cancel.reset()`-ing between turns. M6.17 BUG H1 + M3.
+    pub fn with_cancel(mut self, token: crate::cancel::CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
@@ -797,6 +815,7 @@ impl Agent {
         let permission_mode_default = self.permission_mode;
         let approver = self.approver.clone();
         let history = self.history.clone();
+        let cancel = self.cancel.clone();
 
         try_stream! {
             {
@@ -834,9 +853,16 @@ impl Agent {
                 // Config errors (missing API key, bad model name, etc.)
                 // won't fix themselves between attempts — skip the retry
                 // loop for those and surface the error immediately.
+                //
+                // M6.17 BUG M3: the backoff sleep `tokio::select!`s
+                // against the cancel token (when one is wired in) so a
+                // user-triggered Cancel during a 1-2-4s wait short-
+                // circuits with a clear error instead of stalling for
+                // up to 7 s.
                 let raw = {
                     let mut last_err = None;
                     let mut stream_result = None;
+                    let mut cancelled_during_retry = false;
                     for attempt in 0..=max_retries {
                         match provider.stream(req.clone()).await {
                             Ok(s) => { stream_result = Some(s); break; }
@@ -848,12 +874,25 @@ impl Agent {
                                         "\x1b[33m[retry {}/{} after {}s: {}]\x1b[0m",
                                         attempt + 1, max_retries, delay.as_secs(), e
                                     );
-                                    tokio::time::sleep(delay).await;
+                                    if let Some(token) = &cancel {
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(delay) => {}
+                                            _ = token.cancelled() => {
+                                                cancelled_during_retry = true;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        tokio::time::sleep(delay).await;
+                                    }
                                 }
                                 last_err = Some(e);
                                 if is_config { break; }
                             }
                         }
+                    }
+                    if cancelled_during_retry {
+                        Err(Error::Provider("cancelled by user during retry backoff".into()))?
                     }
                     match stream_result {
                         Some(s) => s,
@@ -865,6 +904,11 @@ impl Agent {
                 let mut turn_text = String::new();
                 let mut turn_thinking = String::new();
                 let mut turn_tool_uses: Vec<ContentBlock> = Vec::new();
+                // L4 (M6.17): id → parse error message for any tool use
+                // whose JSON input failed to parse mid-stream. The per-
+                // tool dispatch loop emits a synthetic error tool_result
+                // for any id present here, instead of running the tool.
+                let mut turn_parse_errors: Vec<(String, String)> = Vec::new();
                 let mut turn_stop_reason: Option<String> = None;
 
                 while let Some(ev) = assembled.next().await {
@@ -882,7 +926,53 @@ impl Agent {
                             // pane, route a new event through here.
                             turn_thinking.push_str(&s);
                         }
+                        AssembledEvent::ToolParseFailed { id, name, error } => {
+                            // L4 (M6.17): the provider sent malformed JSON
+                            // for this tool use. Synthesize a ToolUse with
+                            // empty input so the assistant message stays
+                            // well-formed (some providers reject a tool
+                            // ID without a matching tool_use), then push
+                            // an error tool_result the model reads on the
+                            // next iteration. Pre-fix this killed the
+                            // entire turn via `?`.
+                            let synth_block = ContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::json!({}),
+                            };
+                            yield AgentEvent::ToolCallStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::json!({}),
+                            };
+                            turn_tool_uses.push(synth_block);
+                            // Stash the parse error so the per-tool loop
+                            // below can emit a matching error result.
+                            turn_parse_errors.push((id, error));
+                        }
                         AssembledEvent::ToolUse(block) => {
+                            // L1 (M6.17): announce the tool call as soon as
+                            // it's parsed, BEFORE the per-tool execution
+                            // loop's approval / plan-mode / dispatch gates.
+                            // Pre-fix the announce came right before the
+                            // actual call() — meaning the user saw the
+                            // assistant text stream, then a silent pause
+                            // (during which the model had decided to call
+                            // tools but the UI didn't show it), then the
+                            // tool result. Yielding here gives an instant
+                            // "[tool: X] queued" indicator the moment the
+                            // tool block lands. Approval gating still
+                            // happens later — denial / plan-mode block
+                            // emit ToolCallDenied / ToolCallResult as
+                            // before, so UI consumers don't get orphaned
+                            // ToolCallStart events.
+                            if let ContentBlock::ToolUse { id, name, input } = &block {
+                                yield AgentEvent::ToolCallStart {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                };
+                            }
                             turn_tool_uses.push(block);
                         }
                         AssembledEvent::Done { stop_reason, usage } => {
@@ -946,6 +1036,29 @@ impl Agent {
                 let mut result_blocks: Vec<ContentBlock> = Vec::new();
                 for tu in &turn_tool_uses {
                     let ContentBlock::ToolUse { id, name, input } = tu else { continue };
+
+                    // L4 (M6.17): if this tool's JSON input failed to
+                    // parse during assembly, short-circuit with a
+                    // synthetic error tool_result instead of dispatching
+                    // (the tool would just fail on the empty input
+                    // anyway, and the parse-error message is more
+                    // actionable for the model).
+                    if let Some((_, err)) =
+                        turn_parse_errors.iter().find(|(eid, _)| eid == id)
+                    {
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: err.clone().into(),
+                            is_error: true,
+                        });
+                        yield AgentEvent::ToolCallResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: Err(err.clone()),
+                            ui_resource: None,
+                        };
+                        continue;
+                    }
 
                     let tool = match tools.get(name) {
                         Some(t) => t,
@@ -1113,12 +1226,10 @@ impl Agent {
                         }
                     }
 
-                    yield AgentEvent::ToolCallStart {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    };
-
+                    // ToolCallStart was yielded at parse time (see the
+                    // assembled-event loop above) so the UI shows the
+                    // tool queued before the approval modal pops. The
+                    // dispatch site here just runs the call.
                     let tool_result = tool.call_multimodal(input.clone()).await;
 
                     let (content, is_error) = match &tool_result {
@@ -1205,24 +1316,40 @@ fn maybe_truncate_to_disk(content: &str) -> String {
         return content.to_string();
     }
     // Save full content to a temp file.
+    // M2 (M6.17): include a UUID per truncation. Pre-fix the filename
+    // was just `tool-<pid>.txt` — every truncation in the same process
+    // overwrote the previous one, so the model's "reference the full
+    // file" affordance was a lie after the second truncation. Surface
+    // any write failure in the truncation message instead of silently
+    // promising a file that doesn't exist.
     let tmp_dir = std::env::temp_dir().join("thclaws-tool-output");
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let filename = format!("tool-{}.txt", std::process::id());
+    let mkdir_err = std::fs::create_dir_all(&tmp_dir).err();
+    let filename = format!(
+        "tool-{}-{}.txt",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
     let path = tmp_dir.join(&filename);
-    let _ = std::fs::write(&path, content);
+    let write_err = std::fs::write(&path, content).err();
 
-    // Return a preview + pointer to the full file.
     let preview_end = content
         .char_indices()
         .nth(2000)
         .map(|(i, _)| i)
         .unwrap_or(content.len().min(2000));
-    format!(
-        "{}\n\n... [truncated: {} total bytes — full output saved to {}]",
-        &content[..preview_end],
-        content.len(),
-        path.display()
-    )
+    let footer = match (mkdir_err, write_err) {
+        (None, None) => format!(
+            "... [truncated: {} total bytes — full output saved to {}]",
+            content.len(),
+            path.display()
+        ),
+        (Some(e), _) | (_, Some(e)) => format!(
+            "... [truncated: {} total bytes — could not save full output to disk ({}); preview only]",
+            content.len(),
+            e
+        ),
+    };
+    format!("{}\n\n{}", &content[..preview_end], footer)
 }
 
 /// Drain an agent stream into a blocking result. Useful for tests and for
@@ -2158,7 +2285,13 @@ mod tests {
         assert!(!path.exists());
         // Denial was surfaced:
         assert_eq!(outcome.tool_denials, vec!["Write".to_string()]);
-        assert!(outcome.tool_calls.is_empty());
+        // M6.17 BUG L1: ToolCallStart fires at parse time (before the
+        // approval gate), so denied calls now appear in tool_calls
+        // alongside tool_denials. Pre-fix this asserted empty because
+        // the start event came AFTER approval; the new contract is
+        // "tool_calls = parsed-from-model", "tool_denials = of those,
+        // which were rejected".
+        assert_eq!(outcome.tool_calls, vec!["Write".to_string()]);
 
         // The tool_result block in history should be is_error=true with a "denied" marker.
         let history = agent.history_snapshot();
@@ -2249,5 +2382,62 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.iterations, 2);
         assert_eq!(outcome.stop_reason.as_deref(), Some("max_iterations"));
+    }
+
+    /// M6.17 BUG H1 + M3: when a cancel token is wired in and gets
+    /// fired during the retry-backoff sleep, the agent stream errors
+    /// out with a "cancelled by user" message instead of waiting the
+    /// full 1+2+4 = 7 s backoff cycle. Pre-fix the sleep blocked
+    /// uninterruptibly.
+    #[tokio::test]
+    async fn cancel_during_retry_sleep_short_circuits() {
+        // Provider that always returns a transient error so the agent
+        // hits the retry path on every attempt.
+        struct AlwaysErrProvider;
+        #[async_trait]
+        impl Provider for AlwaysErrProvider {
+            async fn stream(
+                &self,
+                _req: crate::providers::StreamRequest,
+            ) -> Result<EventStream> {
+                Err(Error::Provider("transient".into()))
+            }
+        }
+
+        let token = crate::cancel::CancelToken::new();
+        let agent = Agent::new(
+            Arc::new(AlwaysErrProvider),
+            ToolRegistry::default(),
+            "test-model",
+            "",
+        )
+        .with_cancel(token.clone());
+
+        // Fire cancel after 100 ms so it hits during the first
+        // 1-second backoff sleep (well before the would-be 7s total).
+        let token_for_cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            token_for_cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = collect_agent_turn(agent.run_turn("hi".into())).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected agent stream to error after cancellation"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("cancelled"),
+            "expected cancel message, got: {msg}"
+        );
+        // Without the fix, this would be ~7 s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel didn't short-circuit the retry backoff (took {elapsed:?})",
+        );
     }
 }

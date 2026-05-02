@@ -306,7 +306,12 @@ impl DisplayMessage {
 pub struct SharedSessionHandle {
     pub input_tx: mpsc::Sender<ShellInput>,
     pub events_tx: broadcast::Sender<ViewEvent>,
-    pub cancel: Arc<AtomicBool>,
+    /// Cooperative cancel handle (M6.17 BUGs H1 + M3). Replaces the
+    /// bare `Arc<AtomicBool>` so the worker can `select!` on async
+    /// cancellation rather than polling the flag only between stream
+    /// events. Call `request_cancel()` to flip the flag AND wake
+    /// every active `cancelled().await`.
+    pub cancel: crate::cancel::CancelToken,
     /// Frontend signals this once it's past the launch modals so
     /// deferred startup (MCP spawn, etc.) can start making user-facing
     /// prompts. Calling `signal()` multiple times is fine.
@@ -319,7 +324,7 @@ impl SharedSessionHandle {
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.cancel();
     }
 }
 
@@ -363,6 +368,11 @@ pub struct WorkerState {
     /// this mirror the Team tab has no lead entry. `None` inside the
     /// mutex means the file could not be opened; writes are silent.
     pub lead_log: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    /// Cooperative cancel handle, shared with the worker loop and
+    /// (via `with_cancel`) the agent. M6.17 BUG H1 + M3 — wired into
+    /// `rebuild_agent` so a `/model` swap doesn't lose the cancel
+    /// plumbing.
+    pub cancel: crate::cancel::CancelToken,
 }
 
 impl WorkerState {
@@ -390,7 +400,8 @@ impl WorkerState {
             &self.config.model,
             &self.system_prompt,
         )
-        .with_approver(self.approver.clone());
+        .with_approver(self.approver.clone())
+        .with_cancel(self.cancel.clone());
         self.agent = new_agent;
         self.agent.permission_mode = prev_perm;
         self.agent.thinking_budget = prev_thinking;
@@ -549,7 +560,7 @@ pub fn spawn_with_approver(
 ) -> SharedSessionHandle {
     let (input_tx, input_rx) = mpsc::channel::<ShellInput>();
     let (events_tx, _) = broadcast::channel::<ViewEvent>(256);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = crate::cancel::CancelToken::new();
     let ready_gate = Arc::new(ReadyGate::new());
 
     let events_tx_for_thread = events_tx.clone();
@@ -593,7 +604,7 @@ async fn run_worker(
     input_rx: mpsc::Receiver<ShellInput>,
     input_tx_self: mpsc::Sender<ShellInput>,
     events_tx: broadcast::Sender<ViewEvent>,
-    cancel: Arc<AtomicBool>,
+    cancel: crate::cancel::CancelToken,
     approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
     ready_gate: Arc<ReadyGate>,
 ) {
@@ -776,8 +787,9 @@ async fn run_worker(
             "no LLM provider configured — open Settings → Provider API keys to add one",
         ))
     });
-    let mut agent =
-        Agent::new(provider, tools.clone(), &config.model, &system).with_approver(approver.clone());
+    let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
+        .with_approver(approver.clone())
+        .with_cancel(cancel.clone());
     // Respect the user's configured permission mode (project
     // `.thclaws/settings.json` can set it to "ask"). Without this the
     // GUI's Ask mode flag had no effect because the Agent was built
@@ -858,6 +870,7 @@ async fn run_worker(
         mcp_clients,
         warned_file_size: false,
         lead_log,
+        cancel: cancel.clone(),
     };
 
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
@@ -888,11 +901,11 @@ async fn run_worker(
     while let Ok(input) = input_rx.recv() {
         match input {
             ShellInput::Line(text) => {
-                cancel.store(false, Ordering::Relaxed);
+                cancel.reset();
                 handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
             }
             ShellInput::LineWithImages { text, images } => {
-                cancel.store(false, Ordering::Relaxed);
+                cancel.reset();
                 handle_line_with_images(
                     text,
                     images,
@@ -1030,7 +1043,7 @@ async fn run_worker(
                 break;
             }
             ShellInput::TeamMessages(msgs) => {
-                cancel.store(false, Ordering::Relaxed);
+                cancel.reset();
                 handle_team_messages(msgs, &mut state, &events_tx, &cancel).await;
             }
             ShellInput::McpReady {
@@ -1321,7 +1334,7 @@ async fn handle_line(
     text: String,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
     input_tx: &mpsc::Sender<ShellInput>,
 ) {
     let trimmed = text.trim();
@@ -1355,16 +1368,23 @@ async fn handle_line(
     }
 
     if trimmed.starts_with('/') {
-        // `/<skill-name> [args]` shortcut — same UX as the CLI repl
-        // (see repl.rs:2406). If `parse_slash` returns Unknown AND the
-        // first word matches an installed skill name, rewrite to a
-        // normal user prompt and fall through to the regular agent
-        // pipeline; the model then calls `Skill(name: …)` to load the
-        // skill content. Without this, every plugin-contributed skill
-        // surfaced as "unknown command" in the GUI even when the
-        // skill was loaded into the registry.
+        // `/<word> [args]` shortcut — same UX + resolution order as
+        // the CLI repl (see repl.rs:2601-2632). If `parse_slash`
+        // returns Unknown, try to resolve `<word>` against:
+        //   1. installed skills → rewrite into a "call Skill(...)"
+        //      prompt
+        //   2. user / plugin prompt commands (.md templates) →
+        //      render the template body with $ARGUMENTS substitution
+        // and fall through to the regular agent pipeline. Without
+        // this fallback, every custom command surfaced via the
+        // slash popup landed as "unknown command" in the GUI even
+        // though the command was discoverable in the popup.
         if let Some(crate::repl::SlashCommand::Unknown(what)) = crate::repl::parse_slash(trimmed) {
             let word = what.split_whitespace().next().unwrap_or("").to_string();
+            let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
+            let args = body.strip_prefix(&word).unwrap_or("").trim();
+
+            // (1) Skill lookup.
             let skill_present = state
                 .skill_store
                 .lock()
@@ -1372,8 +1392,6 @@ async fn handle_line(
                 .map(|s| s.skills.contains_key(&word))
                 .unwrap_or(false);
             if skill_present {
-                let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
-                let args = body.strip_prefix(&word).unwrap_or("").trim();
                 let args_note = if args.is_empty() {
                     String::new()
                 } else {
@@ -1382,10 +1400,26 @@ async fn handle_line(
                 let rewritten = format!(
                     "The user ran the `/{word}` slash command. Call `Skill(name: \"{word}\")` right away and follow the instructions it returns.{args_note}"
                 );
-                // Fall through to the regular agent pipeline below
-                // with the rewritten prompt instead of dispatching as
-                // a slash command.
                 emit_skill_resolution_hint(events_tx, &word);
+                let stream = Box::pin(state.agent.run_turn(rewritten));
+                let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+                let _ = lead_mb.write_status("lead", "working", None);
+                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+                return;
+            }
+
+            // (2) Custom command (.md template) lookup. Re-discover
+            // each call so freshly-installed plugins surface without
+            // a restart — matches the popup's discover-each-render
+            // pattern in gui.rs:1835. The plugin_command_dirs
+            // extras include both user-scope and project-scope
+            // plugin contributions.
+            let command_store = crate::commands::CommandStore::discover_with_extra(
+                &crate::plugins::plugin_command_dirs(),
+            );
+            if let Some(cmd) = command_store.get(&word).cloned() {
+                let rewritten = cmd.render(args);
+                emit_command_resolution_hint(events_tx, &word, &cmd.source);
                 let stream = Box::pin(state.agent.run_turn(rewritten));
                 let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
                 let _ = lead_mb.write_status("lead", "working", None);
@@ -1424,7 +1458,7 @@ async fn handle_line_with_images(
     images: Vec<(String, String)>,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
     input_tx: &mpsc::Sender<ShellInput>,
 ) {
     let trimmed = text.trim();
@@ -1487,23 +1521,33 @@ async fn drive_turn_stream(
     >,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
     lead_mb: &crate::team::Mailbox,
     input_tx: &mpsc::Sender<ShellInput>,
 ) {
-    while let Some(ev) = stream.next().await {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
-            write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
-            save_history(&state.agent, &mut state.session, &state.session_store);
-            let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
-                &state.session_store,
-                &state.session.id,
-            )));
-            let _ = events_tx.send(ViewEvent::TurnDone);
-            let _ = lead_mb.write_status("lead", "active", None);
-            return;
-        }
+    loop {
+        // M6.17 BUG H1: race the next stream event against the cancel
+        // signal so a long tool run / stalled provider stream doesn't
+        // delay the user's Stop button. Pre-fix the cancel flag was
+        // only checked between events, so the user could click Stop
+        // and wait seconds to minutes before anything happened.
+        let ev = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
+                write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
+                save_history(&state.agent, &mut state.session, &state.session_store);
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                let _ = lead_mb.write_status("lead", "active", None);
+                return;
+            }
+            ev = stream.next() => ev,
+        };
+        let Some(ev) = ev else { break };
         match ev {
             Ok(AgentEvent::Text(s)) => {
                 write_lead_log(&state.lead_log, &s);
@@ -1752,6 +1796,17 @@ fn emit_skill_resolution_hint(events_tx: &broadcast::Sender<ViewEvent>, name: &s
     )));
 }
 
+fn emit_command_resolution_hint(
+    events_tx: &broadcast::Sender<ViewEvent>,
+    name: &str,
+    source: &std::path::Path,
+) {
+    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+        "(/{name} → prompt from {})",
+        source.display()
+    )));
+}
+
 fn write_lead_log(log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>, s: &str) {
     use std::io::Write;
     if let Ok(mut guard) = log.lock() {
@@ -1766,7 +1821,7 @@ async fn handle_team_messages(
     msgs: Vec<crate::team::TeamMessage>,
     state: &mut WorkerState,
     events_tx: &broadcast::Sender<ViewEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &crate::cancel::CancelToken,
 ) {
     if msgs.is_empty() {
         return;
@@ -1814,19 +1869,28 @@ async fn handle_team_messages(
     let _ = lead_mb.write_status("lead", "working", None);
 
     let mut stream = Box::pin(state.agent.run_turn(prompt));
-    while let Some(ev) = stream.next().await {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
-            write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
-            save_history(&state.agent, &mut state.session, &state.session_store);
-            let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
-                &state.session_store,
-                &state.session.id,
-            )));
-            let _ = events_tx.send(ViewEvent::TurnDone);
-            let _ = lead_mb.write_status("lead", "active", None);
-            return;
-        }
+    loop {
+        // M6.17 BUG H1: race the next stream event against the cancel
+        // signal — same fix as drive_turn_stream above. handle_team_messages
+        // calls this function-shaped path inline rather than through
+        // drive_turn_stream so it needs its own select! arm.
+        let ev = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
+                write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
+                save_history(&state.agent, &mut state.session, &state.session_store);
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                let _ = lead_mb.write_status("lead", "active", None);
+                return;
+            }
+            ev = stream.next() => ev,
+        };
+        let Some(ev) = ev else { break };
         match ev {
             Ok(AgentEvent::Text(s)) => {
                 write_lead_log(&state.lead_log, &s);
